@@ -248,7 +248,7 @@ class ProcCmdline : SHiPSLeaf {
     
     static [string] GetContent() {
         # Return the command line of the current PowerShell process
-        $currentProc = Get-Process -Id $PID
+        $currentProc = Get-Process -Id $global:PID
         return $currentProc.Path
     }
 }
@@ -572,10 +572,10 @@ class ProcSelfDirectory : SHiPSDirectory {
     
     [object[]] GetChildItem() {
         return @(
-            [ProcProcessCmdline]::new('cmdline', $PID)
-            [ProcProcessStatus]::new('status', $PID)
-            [ProcProcessStat]::new('stat', $PID)
-            [ProcProcessEnviron]::new('environ', $PID)
+            [ProcProcessCmdline]::new('cmdline', $global:PID)
+            [ProcProcessStatus]::new('status', $global:PID)
+            [ProcProcessStat]::new('stat', $global:PID)
+            [ProcProcessEnviron]::new('environ', $global:PID)
         )
     }
 }
@@ -681,7 +681,7 @@ class ProcProcessEnviron : SHiPSLeaf {
     [string] GetContent() {
         # Windows doesn't easily expose other process environments
         # Return current process environment if it's our PID
-        if ($this.ProcessId -eq $PID) {
+        if ($this.ProcessId -eq $global:PID) {
             $sb = [System.Text.StringBuilder]::new()
             foreach ($var in Get-ChildItem Env:) {
                 [void]$sb.Append("$($var.Name)=$($var.Value)`0")

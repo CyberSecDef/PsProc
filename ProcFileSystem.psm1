@@ -1,3 +1,4 @@
+#Requires -Modules SHiPS
 using namespace Microsoft.PowerShell.SHiPS
 
 <#

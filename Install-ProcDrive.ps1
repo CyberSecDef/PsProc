@@ -43,7 +43,7 @@ function Install-ProcDrive {
     
     # Create the proc: drive
     Write-Host "Creating proc: drive..." -ForegroundColor Yellow
-    New-PSDrive -Name proc -PSProvider SHiPS -Root 'ProcFileSystem#ProcRoot' -ErrorAction SilentlyContinue
+    New-PSDrive -Name proc -PSProvider SHiPS -Root 'ProcFileSystem#ProcRoot'
     
     if (Test-Path proc:) {
         Write-Host "`nproc: drive successfully created!" -ForegroundColor Green

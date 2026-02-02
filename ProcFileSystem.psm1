@@ -37,8 +37,8 @@ class ProcRoot : SHiPSDirectory {
         )
         
         # Add process directories (PIDs)
-        Get-Process | ForEach-Object {
-            $items += [ProcProcessDirectory]::new($_.Id.ToString())
+        foreach ($proc in Get-Process) {
+            $items += [ProcProcessDirectory]::new($proc.Id.ToString())
         }
         
         return $items

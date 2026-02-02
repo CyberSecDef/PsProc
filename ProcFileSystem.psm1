@@ -51,7 +51,7 @@ class ProcRoot : SHiPSDirectory {
 class ProcCpuInfo : SHiPSLeaf {
     ProcCpuInfo([string]$name) : base($name) {}
     
-    static [string] GetContent() {
+    [string] GetContent() {
         $sb = [System.Text.StringBuilder]::new()
         $processors = Get-CimInstance -ClassName Win32_Processor
         
@@ -89,7 +89,7 @@ class ProcCpuInfo : SHiPSLeaf {
 class ProcMemInfo : SHiPSLeaf {
     ProcMemInfo([string]$name) : base($name) {}
     
-    static [string] GetContent() {
+    [string] GetContent() {
         $os = Get-CimInstance -ClassName Win32_OperatingSystem
         $cs = Get-CimInstance -ClassName Win32_ComputerSystem
         
@@ -126,7 +126,7 @@ class ProcMemInfo : SHiPSLeaf {
 class ProcVersion : SHiPSLeaf {
     ProcVersion([string]$name) : base($name) {}
     
-    static [string] GetContent() {
+    [string] GetContent() {
         $os = Get-CimInstance -ClassName Win32_OperatingSystem
         return "$($os.Caption) (build $($os.BuildNumber)) $($os.OSArchitecture) $($os.Version)"
     }
@@ -138,7 +138,7 @@ class ProcVersion : SHiPSLeaf {
 class ProcUptime : SHiPSLeaf {
     ProcUptime([string]$name) : base($name) {}
     
-    static [string] GetContent() {
+    [string] GetContent() {
         $os = Get-CimInstance -ClassName Win32_OperatingSystem
         $uptime = (Get-Date) - $os.LastBootUpTime
         $uptimeSeconds = [math]::Round($uptime.TotalSeconds, 2)
@@ -159,7 +159,7 @@ class ProcUptime : SHiPSLeaf {
 class ProcLoadAvg : SHiPSLeaf {
     ProcLoadAvg([string]$name) : base($name) {}
     
-    static [string] GetContent() {
+    [string] GetContent() {
         # Windows doesn't have direct load average, simulate with CPU usage
         $cpu = Get-CimInstance -ClassName Win32_Processor
         $avgLoad = ($cpu | Measure-Object -Property LoadPercentage -Average).Average / 100
@@ -178,7 +178,7 @@ class ProcLoadAvg : SHiPSLeaf {
 class ProcStat : SHiPSLeaf {
     ProcStat([string]$name) : base($name) {}
     
-    static [string] GetContent() {
+    [string] GetContent() {
         $sb = [System.Text.StringBuilder]::new()
         
         # CPU stats
@@ -225,7 +225,7 @@ class ProcStat : SHiPSLeaf {
 class ProcMounts : SHiPSLeaf {
     ProcMounts([string]$name) : base($name) {}
     
-    static [string] GetContent() {
+    [string] GetContent() {
         $sb = [System.Text.StringBuilder]::new()
         
         Get-PSDrive -PSProvider FileSystem | ForEach-Object {
@@ -246,7 +246,7 @@ class ProcMounts : SHiPSLeaf {
 class ProcCmdline : SHiPSLeaf {
     ProcCmdline([string]$name) : base($name) {}
     
-    static [string] GetContent() {
+    [string] GetContent() {
         # Return the command line of the current PowerShell process
         $currentProc = Get-Process -Id $global:PID
         return $currentProc.Path
@@ -259,7 +259,7 @@ class ProcCmdline : SHiPSLeaf {
 class ProcFilesystems : SHiPSLeaf {
     ProcFilesystems([string]$name) : base($name) {}
     
-    static [string] GetContent() {
+    [string] GetContent() {
         $sb = [System.Text.StringBuilder]::new()
         [void]$sb.AppendLine("nodev`tsysfs")
         [void]$sb.AppendLine("nodev`ttmpfs")
@@ -277,7 +277,7 @@ class ProcFilesystems : SHiPSLeaf {
 class ProcSwaps : SHiPSLeaf {
     ProcSwaps([string]$name) : base($name) {}
     
-    static [string] GetContent() {
+    [string] GetContent() {
         $sb = [System.Text.StringBuilder]::new()
         [void]$sb.AppendLine("Filename`t`t`t`tType`t`tSize`tUsed`tPriority")
         
@@ -300,7 +300,7 @@ class ProcSwaps : SHiPSLeaf {
 class ProcPartitions : SHiPSLeaf {
     ProcPartitions([string]$name) : base($name) {}
     
-    static [string] GetContent() {
+    [string] GetContent() {
         $sb = [System.Text.StringBuilder]::new()
         [void]$sb.AppendLine("major minor  #blocks  name")
         
@@ -320,7 +320,7 @@ class ProcPartitions : SHiPSLeaf {
 class ProcModules : SHiPSLeaf {
     ProcModules([string]$name) : base($name) {}
     
-    static [string] GetContent() {
+    [string] GetContent() {
         $sb = [System.Text.StringBuilder]::new()
         
         # List loaded kernel modules (drivers on Windows)
@@ -355,7 +355,7 @@ class ProcNetDirectory : SHiPSDirectory {
 class ProcNetDev : SHiPSLeaf {
     ProcNetDev([string]$name) : base($name) {}
     
-    static [string] GetContent() {
+    [string] GetContent() {
         $sb = [System.Text.StringBuilder]::new()
         [void]$sb.AppendLine("Inter-|   Receive                                                |  Transmit")
         [void]$sb.AppendLine(" face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed")
@@ -378,7 +378,7 @@ class ProcNetDev : SHiPSLeaf {
 class ProcNetRoute : SHiPSLeaf {
     ProcNetRoute([string]$name) : base($name) {}
     
-    static [string] GetContent() {
+    [string] GetContent() {
         $sb = [System.Text.StringBuilder]::new()
         [void]$sb.AppendLine("Iface`tDestination`tGateway `tFlags`tRefCnt`tUse`tMetric`tMask`t`tMTU`tWindow`tIRTT")
         
@@ -399,7 +399,7 @@ class ProcNetRoute : SHiPSLeaf {
 class ProcNetArp : SHiPSLeaf {
     ProcNetArp([string]$name) : base($name) {}
     
-    static [string] GetContent() {
+    [string] GetContent() {
         $sb = [System.Text.StringBuilder]::new()
         [void]$sb.AppendLine("IP address       HW type     Flags       HW address            Mask     Device")
         
@@ -419,7 +419,7 @@ class ProcNetArp : SHiPSLeaf {
 class ProcNetTcp : SHiPSLeaf {
     ProcNetTcp([string]$name) : base($name) {}
     
-    static [string] GetContent() {
+    [string] GetContent() {
         $sb = [System.Text.StringBuilder]::new()
         [void]$sb.AppendLine("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode")
         
@@ -446,7 +446,7 @@ class ProcNetTcp : SHiPSLeaf {
 class ProcNetUdp : SHiPSLeaf {
     ProcNetUdp([string]$name) : base($name) {}
     
-    static [string] GetContent() {
+    [string] GetContent() {
         $sb = [System.Text.StringBuilder]::new()
         [void]$sb.AppendLine("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode")
         
@@ -492,7 +492,7 @@ class ProcSysKernelDirectory : SHiPSDirectory {
 class ProcSysKernelHostname : SHiPSLeaf {
     ProcSysKernelHostname([string]$name) : base($name) {}
     
-    static [string] GetContent() {
+    [string] GetContent() {
         return $env:COMPUTERNAME
     }
 }
@@ -500,7 +500,7 @@ class ProcSysKernelHostname : SHiPSLeaf {
 class ProcSysKernelOstype : SHiPSLeaf {
     ProcSysKernelOstype([string]$name) : base($name) {}
     
-    static [string] GetContent() {
+    [string] GetContent() {
         return "Windows_NT"
     }
 }
@@ -508,7 +508,7 @@ class ProcSysKernelOstype : SHiPSLeaf {
 class ProcSysKernelOsrelease : SHiPSLeaf {
     ProcSysKernelOsrelease([string]$name) : base($name) {}
     
-    static [string] GetContent() {
+    [string] GetContent() {
         $os = Get-CimInstance -ClassName Win32_OperatingSystem
         return $os.Version
     }
@@ -517,7 +517,7 @@ class ProcSysKernelOsrelease : SHiPSLeaf {
 class ProcSysKernelVersion : SHiPSLeaf {
     ProcSysKernelVersion([string]$name) : base($name) {}
     
-    static [string] GetContent() {
+    [string] GetContent() {
         $os = Get-CimInstance -ClassName Win32_OperatingSystem
         return "$($os.Caption) Build $($os.BuildNumber)"
     }
@@ -540,7 +540,7 @@ class ProcDevicesDirectory : SHiPSDirectory {
 class ProcDevicesBlock : SHiPSLeaf {
     ProcDevicesBlock([string]$name) : base($name) {}
     
-    static [string] GetContent() {
+    [string] GetContent() {
         $sb = [System.Text.StringBuilder]::new()
         [void]$sb.AppendLine("Block devices:")
         [void]$sb.AppendLine("  8 sd")
@@ -553,7 +553,7 @@ class ProcDevicesBlock : SHiPSLeaf {
 class ProcDevicesChar : SHiPSLeaf {
     ProcDevicesChar([string]$name) : base($name) {}
     
-    static [string] GetContent() {
+    [string] GetContent() {
         $sb = [System.Text.StringBuilder]::new()
         [void]$sb.AppendLine("Character devices:")
         [void]$sb.AppendLine("  1 mem")

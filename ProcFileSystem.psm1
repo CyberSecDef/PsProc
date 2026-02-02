@@ -608,8 +608,8 @@ class ProcProcessDirectory : SHiPSDirectory {
 class ProcProcessCmdline : SHiPSLeaf {
     hidden [int]$ProcessId
     
-    ProcProcessCmdline([string]$name, [int]$pid) : base($name) {
-        $this.ProcessId = $pid
+    ProcProcessCmdline([string]$name, [int]$procid) : base($name) {
+        $this.ProcessId = $procid
     }
     
     [string] GetContent() {
@@ -628,8 +628,8 @@ class ProcProcessCmdline : SHiPSLeaf {
 class ProcProcessStatus : SHiPSLeaf {
     hidden [int]$ProcessId
     
-    ProcProcessStatus([string]$name, [int]$pid) : base($name) {
-        $this.ProcessId = $pid
+    ProcProcessStatus([string]$name, [int]$procid) : base($name) {
+        $this.ProcessId = $procid
     }
     
     [string] GetContent() {
@@ -652,8 +652,8 @@ class ProcProcessStatus : SHiPSLeaf {
 class ProcProcessStat : SHiPSLeaf {
     hidden [int]$ProcessId
     
-    ProcProcessStat([string]$name, [int]$pid) : base($name) {
-        $this.ProcessId = $pid
+    ProcProcessStat([string]$name, [int]$procid) : base($name) {
+        $this.ProcessId = $procid
     }
     
     [string] GetContent() {
@@ -674,8 +674,8 @@ class ProcProcessStat : SHiPSLeaf {
 class ProcProcessEnviron : SHiPSLeaf {
     hidden [int]$ProcessId
     
-    ProcProcessEnviron([string]$name, [int]$pid) : base($name) {
-        $this.ProcessId = $pid
+    ProcProcessEnviron([string]$name, [int]$procid) : base($name) {
+        $this.ProcessId = $procid
     }
     
     [string] GetContent() {
@@ -695,8 +695,8 @@ class ProcProcessEnviron : SHiPSLeaf {
 class ProcProcessMaps : SHiPSLeaf {
     hidden [int]$ProcessId
     
-    ProcProcessMaps([string]$name, [int]$pid) : base($name) {
-        $this.ProcessId = $pid
+    ProcProcessMaps([string]$name, [int]$procid) : base($name) {
+        $this.ProcessId = $procid
     }
     
     [string] GetContent() {

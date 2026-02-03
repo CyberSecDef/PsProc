@@ -2,6 +2,12 @@
 
 A PowerShell 7+ module that implements a Linux `/proc` pseudo-filesystem using SHiPS (Script Hierarchy in PowerShell). This provides a familiar, filesystem-like interface for accessing Windows system information.
 
+## Visualization
+
+![PsProc Subway Map](codebase-subway-map.png)
+
+*The PsProc filesystem structure visualized as a subway map. Each colored line represents a different category of system information.*
+
 ## Features
 
 This implementation mirrors many `/proc` components found in Linux:
@@ -290,6 +296,51 @@ New-PSDrive -Name proc -PSProvider SHiPS -Root 'ProcFileSystem#ProcRoot'
 
 ### Permission Errors
 Some operations require elevated privileges. Run PowerShell as Administrator if needed.
+
+## Visualization
+
+### Subway Map
+
+The PsProc filesystem structure can be visualized as a subway/metro map, showing the hierarchical relationships between different components.
+
+#### Generating the Subway Map
+
+```powershell
+# Using the PowerShell wrapper (recommended)
+.\New-SubwayMap.ps1
+
+# Open the map after generation
+.\New-SubwayMap.ps1 -Open
+
+# Custom output path
+.\New-SubwayMap.ps1 -OutputPath "my-custom-map.png"
+```
+
+Or using Python directly:
+```bash
+python3 Generate-SubwayMap.py
+```
+
+#### Map Legend
+
+The subway map uses colored lines to represent different categories:
+
+- **System Info Line (Red)** - System information files (cpuinfo, meminfo, version, uptime, loadavg, stat)
+- **Network Line (Teal)** - Network-related files in `/proc/net/` (dev, route, arp, tcp, udp)
+- **Configuration Line (Orange)** - System configuration in `/proc/sys/` (hostname, ostype, osrelease, version)
+- **Devices Line (Coral)** - Device information in `/proc/devices/` (block, character)
+- **Process Line (Dark Blue)** - Process-related directories (`/proc/self/`, `/proc/[PID]/`)
+- **Storage Line (Purple)** - Storage and filesystem information (mounts, swaps, partitions, filesystems)
+
+The central hub `proc:/` connects all lines, representing the root of the filesystem hierarchy.
+
+#### Requirements for Visualization
+
+- Python 3.x
+- matplotlib (`pip install matplotlib`)
+- numpy (`pip install numpy`)
+
+The PowerShell wrapper script will automatically check for and install missing dependencies.
 
 ## Contributing
 

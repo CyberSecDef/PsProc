@@ -99,21 +99,8 @@ if (-not (Test-Path $pythonScript)) {
     Write-Error "Generate-SubwayMap.py not found in $ScriptDir"
 }
 
-# Set output path for Python script
-$env:SUBWAY_MAP_OUTPUT = $OutputPath
-
 try {
-    # Create a temporary modified version if custom output path is specified
-    if ($OutputPath -ne "codebase-subway-map.png") {
-        $scriptContent = Get-Content $pythonScript -Raw
-        $scriptContent = $scriptContent -replace "def save\(self, filename='codebase-subway-map\.png'", "def save(self, filename='$OutputPath'"
-        $tempScript = Join-Path ([System.IO.Path]::GetTempPath()) "temp-subway-map.py"
-        Set-Content -Path $tempScript -Value $scriptContent
-        python3 $tempScript
-        Remove-Item $tempScript -ErrorAction SilentlyContinue
-    } else {
-        python3 $pythonScript
-    }
+    python3 $pythonScript --output $OutputPath
     
     # Verify the file was created
     if (Test-Path $OutputPath) {
@@ -130,10 +117,11 @@ try {
             if ($IsWindows -or $env:OS -match 'Windows') {
                 Start-Process $OutputPath
             } elseif ($IsMacOS) {
-                open $OutputPath
+                & open $OutputPath
             } else {
-                xdg-open $OutputPath 2>$null
-                if ($LASTEXITCODE -ne 0) {
+                try {
+                    & xdg-open $OutputPath 2>&1 | Out-Null
+                } catch {
                     Write-Host "Could not auto-open file. Please open manually: $OutputPath" -ForegroundColor Yellow
                 }
             }

@@ -9,6 +9,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 from matplotlib.patches import FancyBboxPatch, Circle
 import numpy as np
+import argparse
+import sys
 from typing import List, Tuple, Dict
 
 # Define the codebase structure based on analysis
@@ -281,13 +283,30 @@ class SubwayMapGenerator:
 
 def main():
     """Main function to generate the subway map"""
+    parser = argparse.ArgumentParser(
+        description='Generate a subway map visualization of the PsProc codebase structure'
+    )
+    parser.add_argument(
+        '-o', '--output',
+        default='codebase-subway-map.png',
+        help='Output filename for the subway map (default: codebase-subway-map.png)'
+    )
+    parser.add_argument(
+        '--dpi',
+        type=int,
+        default=300,
+        help='DPI for the output image (default: 300)'
+    )
+    
+    args = parser.parse_args()
+    
     print("Generating PsProc Codebase Subway Map...")
     
     generator = SubwayMapGenerator()
     generator.generate_map()
-    generator.save()
+    generator.save(filename=args.output, dpi=args.dpi)
     
-    print("Done! Map saved as 'codebase-subway-map.png'")
+    print(f"Done! Map saved as '{args.output}'")
 
 
 if __name__ == '__main__':

@@ -2,12 +2,6 @@
 
 A PowerShell 7+ module that implements a Linux `/proc` pseudo-filesystem using SHiPS (Script Hierarchy in PowerShell). This provides a familiar, filesystem-like interface for accessing Windows system information.
 
-## Visualization
-
-![PsProc Subway Map](codebase-subway-map.png)
-
-*The PsProc filesystem structure visualized as a subway map. Each colored line represents a different category of system information.*
-
 ## Features
 
 This implementation mirrors many `/proc` components found in Linux:
@@ -301,6 +295,10 @@ Some operations require elevated privileges. Run PowerShell as Administrator if 
 
 ### Subway Map
 
+![PsProc Subway Map](codebase-subway-map.png)
+
+*The PsProc filesystem structure visualized as a subway map. Each colored line represents a different category of system information.*
+
 The PsProc filesystem structure can be visualized as a subway/metro map, showing the hierarchical relationships between different components.
 
 #### Generating the Subway Map
@@ -318,7 +316,14 @@ The PsProc filesystem structure can be visualized as a subway/metro map, showing
 
 Or using Python directly:
 ```bash
+# Default output
 python3 Generate-SubwayMap.py
+
+# Custom output file
+python3 Generate-SubwayMap.py --output my-map.png
+
+# Custom DPI
+python3 Generate-SubwayMap.py --output my-map.png --dpi 150
 ```
 
 #### Map Legend

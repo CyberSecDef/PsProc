@@ -27,7 +27,8 @@ function Install-ProcDrive {
     if (-not (Get-Module -ListAvailable -Name SHiPS)) {
         Write-Host "Installing SHiPS module..." -ForegroundColor Yellow
         Install-Module -Name SHiPS -Scope CurrentUser -Force -AllowClobber
-    } else {
+    }
+    else {
         Write-Host "SHiPS module already installed" -ForegroundColor Green
     }
     
@@ -43,7 +44,13 @@ function Install-ProcDrive {
     
     # Create the proc: drive
     Write-Host "Creating proc: drive..." -ForegroundColor Yellow
-    New-PSDrive -Name proc -PSProvider SHiPS -Root 'ProcFileSystem#ProcRoot'
+    if (-not (Test-Path proc:)) {
+        New-PSDrive -Name proc -PSProvider SHiPS -Root 'ProcFileSystem#ProcRoot' -Scope Global
+        Write-Host "proc: drive created with global scope" -ForegroundColor Green
+    }
+    else {
+        Write-Host "proc: drive already exists" -ForegroundColor Yellow
+    }
     
     if (Test-Path proc:) {
         Write-Host "`nproc: drive successfully created!" -ForegroundColor Green
@@ -53,7 +60,8 @@ function Install-ProcDrive {
         Write-Host "  cat cpuinfo" -ForegroundColor White
         Write-Host "  cat meminfo" -ForegroundColor White
         Write-Host "`nRun with -ShowExamples to see more usage examples" -ForegroundColor Gray
-    } else {
+    }
+    else {
         Write-Error "Failed to create proc: drive"
     }
 }
@@ -64,7 +72,8 @@ function Uninstall-ProcDrive {
     if (Test-Path proc:) {
         Remove-PSDrive -Name proc -Force
         Write-Host "proc: drive removed successfully" -ForegroundColor Green
-    } else {
+    }
+    else {
         Write-Host "proc: drive not found" -ForegroundColor Yellow
     }
     
@@ -144,11 +153,14 @@ function Show-Examples {
 # Main execution
 if ($Install) {
     Install-ProcDrive
-} elseif ($Uninstall) {
+}
+elseif ($Uninstall) {
     Uninstall-ProcDrive
-} elseif ($ShowExamples) {
+}
+elseif ($ShowExamples) {
     Show-Examples
-} else {
+}
+else {
     Write-Host "PowerShell proc: Drive Setup" -ForegroundColor Cyan
     Write-Host "Usage:" -ForegroundColor Yellow
     Write-Host "  .\Install-ProcDrive.ps1 -Install        # Install and create proc: drive"

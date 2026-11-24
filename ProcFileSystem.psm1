@@ -1,4 +1,3 @@
-#Requires -Modules SHiPS
 using namespace Microsoft.PowerShell.SHiPS
 
 <#
@@ -8,8 +7,14 @@ using namespace Microsoft.PowerShell.SHiPS
     Creates a proc: drive that provides read-only access to system information
     similar to Linux /proc pseudo-filesystem
 .NOTES
-    Requires: PowerShell 7+ and SHiPS module (Install-Module -Name SHiPS)
+    Requires: PowerShell 7+ on Windows and the SHiPS module. Load it through the module
+    manifest (Import-Module ProcFileSystem): the manifest's RequiredModules loads SHiPS
+    before this file's classes are parsed.
 #>
+
+if (-not $IsWindows) {
+    throw 'ProcFileSystem requires Windows: it reads CIM, performance counters and the NetTCPIP cmdlets.'
+}
 
 #region Root Directory
 [SHiPSProvider(UseCache = $true)]
@@ -717,5 +722,40 @@ class ProcProcessMaps : SHiPSLeaf {
 }
 #endregion
 
-# Export the root class
-Export-ModuleMember -Function * -Cmdlet *
+#region Drive helpers
+function Mount-ProcDrive {
+    <#
+    .SYNOPSIS
+        Creates the proc: drive in the global scope (idempotent).
+    .DESCRIPTION
+        New-PSDrive defaults to the caller's local scope, so a drive created inside a
+        script or function disappears when it returns. This always creates it globally.
+    #>
+    [CmdletBinding()]
+    param(
+        [string]$Name = 'proc',
+        [switch]$PassThru
+    )
+    $drive = Get-PSDrive -Name $Name -Scope Global -ErrorAction SilentlyContinue
+    if ($drive) {
+        Write-Verbose "Drive '$($Name):' already exists"
+    } else {
+        $drive = New-PSDrive -Name $Name -PSProvider SHiPS -Root 'ProcFileSystem#ProcRoot' -Scope Global -ErrorAction Stop
+    }
+    if ($PassThru) { $drive }
+}
+
+function Dismount-ProcDrive {
+    <#
+    .SYNOPSIS
+        Removes the proc: drive from the global scope, if present.
+    #>
+    [CmdletBinding()]
+    param([string]$Name = 'proc')
+    if (Get-PSDrive -Name $Name -Scope Global -ErrorAction SilentlyContinue) {
+        Remove-PSDrive -Name $Name -Scope Global -Force
+    }
+}
+
+Export-ModuleMember -Function Mount-ProcDrive, Dismount-ProcDrive
+#endregion

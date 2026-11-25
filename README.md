@@ -208,6 +208,44 @@ Most files take 50–400 ms because they query WMI or performance counters. `cpu
 about a second, almost all of it in `Win32_Processor` itself. Listing the root directory,
 PIDs included, takes about 25 ms.
 
+## Status and remaining work
+
+Tested on Windows 11 Pro (build 26300), PowerShell 7.6.10, SHiPS 0.8.1 and Pester 6.2.0:
+66 tests pass, elevated and under a restricted (Basic User) token. Still to do:
+
+**Testing gaps**
+- Not yet run as an ordinary standard (non-admin, UAC-filtered) user. The test machine's
+  admin account isn't UAC-filtered, so non-elevated runs used the stricter Basic User
+  token, under which WMI is denied entirely and the WMI-backed system files fail.
+- Not tested on Windows 10, Windows Server, ARM64, or machines with more than 64 logical
+  CPUs (processor groups). The `/proc/stat` code handles `group,N` counter instances, but
+  that path hasn't run on real hardware.
+- No CI. The suite needs a Windows runner; a GitHub Actions `windows-latest` job running
+  `.\Test-ProcDrive.ps1 -RunTests` would cover it.
+
+**Known limitations**
+- `cpuinfo` takes about a second because `Win32_Processor` does. The static fields (model,
+  family, flags, cache) could be cached at import, leaving only MHz to query live.
+- Importing the module by file path (`Import-Module .\ProcFileSystem.psd1`) prints a
+  harmless "module not loaded" error: SHiPS re-imports the module by name in its own
+  runspace and then falls back to the path. Installing with `-Install` avoids it.
+- `modules` reports every driver's size as 0, since `Win32_SystemDriver` has no size.
+  `EnumDeviceDrivers` plus the image headers could provide real sizes.
+- `devices\block` and `devices\character` are static illustrative tables, not real data.
+- `net\tcp*` and `net\udp*` report `uid` and `inode` as 0, so a socket can't be mapped to
+  a process through `proc:`. A non-Linux extra column (or file) exposing `OwningProcess`
+  would help.
+- `loadavg` measures CPU demand only. Linux also counts threads blocked on I/O; an
+  equivalent would need run-queue sampling through PDH.
+- `maps` lists module images only, not heaps, stacks or other mappings
+  (`VirtualQueryEx` could fill this in for processes the caller can open).
+- `environ` only works for `self`. Reading another process's environment would mean
+  reading its PEB with `ReadProcessMemory`.
+- `stat` fields 10–13 (page faults) and per-process I/O are 0. Win32_Process `PageFaults`
+  and `GetProcessIoCounters` could supply real values, and an `io` file could be added.
+- SHiPS is unmaintained upstream. If a future PowerShell release breaks it, the provider
+  would need porting to a compiled `NavigationCmdletProvider`.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

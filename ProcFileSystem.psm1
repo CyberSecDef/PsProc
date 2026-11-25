@@ -99,7 +99,7 @@ public static long[] SystemTimes() {
 
 // Load average. Windows keeps no run-queue average, so sample CPU demand (busy fraction
 // x CPU count, i.e. "CPUs' worth of work") every 5 s and apply the same exponential
-// decay Linux uses for its 1/5/15-minute averages. The first sample seeds all three.
+// decay Linux uses for its 1/5/15-minute averages, seeded with the average since boot.
 static System.Threading.Timer loadTimer;
 static readonly object loadLock = new object();
 static readonly double[] loadAvg = new double[3];
@@ -113,7 +113,14 @@ public static void StartLoadSampler() {
         long idle, kernel, user;
         GetSystemTimes(out idle, out kernel, out user);
         lastIdle = idle; lastBusy = (kernel - idle) + user;
-        loadTimer = new System.Threading.Timer(_ => SampleLoad(), null, 1000, 5000);
+        // Seed with the average demand since boot so the first read isn't 0.00.
+        double total = lastBusy + idle;
+        if (total > 0) {
+            double demand = Environment.ProcessorCount * lastBusy / total;
+            for (int i = 0; i < 3; i++) loadAvg[i] = demand;
+            loadSeeded = true;
+        }
+        loadTimer = new System.Threading.Timer(_ => SampleLoad(), null, 5000, 5000);
     }
 }
 

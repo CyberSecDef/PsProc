@@ -50,11 +50,12 @@ $lines = (cat proc:\meminfo) -split "`r?`n"
 # Process IDs
 (ls proc:\ | ? Name -match '^\d+$').Name
 
-# Name and RSS of a process (stat fields 2 and 24)
-$f = (cat proc:\self\stat) -split ' '; "$($f[1]) $([long]$f[23] * 4) kB"
+# stat fields after comm. comm can contain spaces ("(Creative Cloud)"), so split after
+# the last ')': field N is $rest[N-3]
+$s = cat proc:\self\stat; $rest = $s.Substring($s.LastIndexOf(')') + 2) -split ' '
 
-# Parent of a process (stat field 4)
-((cat proc:\self\stat) -split ' ')[3]
+# Parent (field 4) and RSS (field 24)
+"ppid $($rest[1]), rss $([long]$rest[21] * 4) kB"
 
 # argv of a process
 (cat proc:\self\cmdline).TrimEnd("`0") -split "`0"

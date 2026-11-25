@@ -201,6 +201,23 @@ Describe 'Process files' -Skip:(-not $IsWin) {
         }
     }
 
+    It 'stat keeps a comm containing a space intact, parseable after the last )' {
+        $exe = Join-Path ([IO.Path]::GetTempPath()) 'has space.exe'
+        Copy-Item (Get-Command ping).Source $exe -Force
+        $p = Start-Process -FilePath $exe -ArgumentList '-n', '30', '127.0.0.1' -PassThru -WindowStyle Hidden
+        try {
+            Start-Sleep -Milliseconds 500
+            $s = (Get-Content "proc:\$($p.Id)\stat").Trim()
+            $s | Should -Match '^\d+ \(has space\) '
+            $rest = $s.Substring($s.LastIndexOf(')') + 2) -split ' '
+            $rest.Count | Should -Be 50       # fields 3..52
+            $rest[1] | Should -Be "$PID"      # field 4, ppid
+        } finally {
+            $p | Stop-Process -Force; $p.WaitForExit(5000) | Out-Null
+            Remove-Item $exe -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     It '<_> stat and status do not throw for Idle (0) and System (4)' -ForEach 0, 4 {
         { Get-Content "proc:\$_\stat" -ErrorAction Stop } | Should -Not -Throw
         { Get-Content "proc:\$_\status" -ErrorAction Stop } | Should -Not -Throw

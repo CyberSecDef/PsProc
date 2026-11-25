@@ -92,7 +92,8 @@ Files that Linux NUL-separates (`cmdline`, `environ`) are NUL-separated here too
 
 ### Process files
 
-- **`stat`** has all 52 proc(5) fields in order. Real values: pid, comm (15 chars, like
+- **`stat`** has all 52 proc(5) fields in order. As on Linux, comm (field 2) can contain
+  spaces, so parse by splitting after the last `)` rather than on every space. Real values: pid, comm (15 chars, like
   Linux), state, ppid, session (the Windows session id), utime/stime in ticks, priority
   and nice (mapped from the priority class), num_threads, starttime in ticks since boot,
   vsize, rss in 4 KiB pages. Fields with no Windows equivalent are 0.
@@ -169,10 +170,15 @@ $btime = ((Get-Content proc:\stat) -split "`r?`n" | Where-Object { $_ -like 'bti
     ForEach-Object { $f = $_.Trim() -split '\s+'; if ($f[3] -eq '0A') { [Convert]::ToInt32($f[1].Split(':')[1], 16) } } |
     Sort-Object -Unique
 
-# Top five processes by resident memory (processes can exit mid-loop, hence SilentlyContinue)
+# Top five processes by resident memory. comm (field 2) can contain spaces, e.g.
+# "(Creative Cloud)", so split after the last ')' as Linux tools do: field N is $rest[N-3].
 Get-ChildItem proc:\ | Where-Object Name -match '^\d+$' | ForEach-Object {
-    $f = (Get-Content "proc:\$($_.Name)\stat" -ErrorAction SilentlyContinue) -split ' '
-    if ($f.Count -ge 24) { [pscustomobject]@{ Pid = $f[0]; Name = $f[1].Trim('()'); RssMB = [long]$f[23] * 4KB / 1MB } }
+    $s = Get-Content "proc:\$($_.Name)\stat" -ErrorAction SilentlyContinue   # processes can exit mid-loop
+    if ($s) {
+        $close = $s.LastIndexOf(')')
+        $rest = $s.Substring($close + 2) -split ' '
+        [pscustomobject]@{ Pid = $_.Name; Name = $s.Substring($s.IndexOf('(') + 1, $close - $s.IndexOf('(') - 1); RssMB = [long]$rest[21] * 4KB / 1MB }
+    }
 } | Sort-Object RssMB -Descending | Select-Object -First 5
 
 # A process's argv

@@ -8,20 +8,21 @@ using namespace Microsoft.PowerShell.SHiPS
     Creates a proc: drive that provides read-only access to system information
     similar to Linux /proc pseudo-filesystem
 .NOTES
-    Requires: PowerShell 7+ on Windows and the SHiPS module. SHiPS must be loaded before
+    Requires: PowerShell 7+ and the SHiPS module. On Linux proc: maps to the real /proc. SHiPS must be loaded before
     this file's classes are parsed; both the manifest's RequiredModules and the #Requires
     line above guarantee that, so importing either the .psd1 or the .psm1 works.
 #>
 
-if (-not $IsWindows) {
-    throw 'ProcFileSystem requires Windows: it reads CIM, performance counters and the NetTCPIP cmdlets.'
-}
+# On Linux the real /proc already exists, so Mount-ProcDrive simply maps proc: onto it and
+# none of the Windows provider below is used. (The classes still have to parse, which is
+# why SHiPS stays a requirement on every platform.)
 
 #region Helpers
 # Native helpers. Class bodies need their types at parse time, so classes never touch
 # [ProcFs.Native] directly; they call the module functions below, which resolve it at
 # runtime. (SHiPS runs class methods in its own runspace, where module functions are
 # still visible.)
+if ($IsWindows) {
 if (-not ('ProcFs.Native' -as [type])) {
     Add-Type -Namespace ProcFs -Name Native -MemberDefinition @'
 [DllImport("shell32.dll", SetLastError = true)]
@@ -144,6 +145,7 @@ public static double[] LoadAverage() { lock (loadLock) { return (double[])loadAv
 '@
 }
 [ProcFs.Native]::StartLoadSampler()
+}
 
 function Get-ProcProperty {
     # Many Process properties throw, or return $null, for protected processes and for
@@ -1064,6 +1066,7 @@ function Mount-ProcDrive {
     .SYNOPSIS
         Creates the proc: drive in the global scope (idempotent).
     .DESCRIPTION
+        On Windows proc: is the SHiPS provider in this module; on Linux it maps to /proc.
         New-PSDrive defaults to the caller's local scope, so a drive created inside a
         script or function disappears when it returns. This always creates it globally.
     #>
@@ -1075,8 +1078,12 @@ function Mount-ProcDrive {
     $drive = Get-PSDrive -Name $Name -Scope Global -ErrorAction SilentlyContinue
     if ($drive) {
         Write-Verbose "Drive '$($Name):' already exists"
-    } else {
+    } elseif ($IsWindows) {
         $drive = New-PSDrive -Name $Name -PSProvider SHiPS -Root 'ProcFileSystem#ProcRoot' -Scope Global -ErrorAction Stop
+    } else {
+        # Linux (and anything else with a real procfs): proc:\stat just reads /proc/4/stat.
+        if (-not (Test-Path /proc/self/stat)) { throw 'No /proc filesystem found on this system.' }
+        $drive = New-PSDrive -Name $Name -PSProvider FileSystem -Root /proc -Scope Global -ErrorAction Stop
     }
     if ($PassThru) { $drive }
 }

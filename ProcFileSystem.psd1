@@ -4,7 +4,7 @@
     GUID                 = '6f0c7e9a-3b2d-4d8e-9a51-2c4f7b1e8d03'
     Author               = 'Robert Weber'
     Copyright            = '(c) 2026 Robert Weber. MIT License.'
-    Description          = 'A Linux-style /proc pseudo-filesystem (proc: drive) for Windows, built on SHiPS.'
+    Description          = 'A Linux-style /proc pseudo-filesystem (proc: drive) for Windows, built on SHiPS. On Linux, proc: maps to the real /proc.'
     PowerShellVersion    = '7.0'
     CompatiblePSEditions = @('Core')
 

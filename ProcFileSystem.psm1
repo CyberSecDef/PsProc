@@ -1,3 +1,4 @@
+#Requires -Modules SHiPS
 using namespace Microsoft.PowerShell.SHiPS
 
 <#
@@ -7,9 +8,9 @@ using namespace Microsoft.PowerShell.SHiPS
     Creates a proc: drive that provides read-only access to system information
     similar to Linux /proc pseudo-filesystem
 .NOTES
-    Requires: PowerShell 7+ on Windows and the SHiPS module. Load it through the module
-    manifest (Import-Module ProcFileSystem): the manifest's RequiredModules loads SHiPS
-    before this file's classes are parsed.
+    Requires: PowerShell 7+ on Windows and the SHiPS module. SHiPS must be loaded before
+    this file's classes are parsed; both the manifest's RequiredModules and the #Requires
+    line above guarantee that, so importing either the .psd1 or the .psm1 works.
 #>
 
 if (-not $IsWindows) {

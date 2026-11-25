@@ -1,221 +1,90 @@
-# proc: Drive Quick Reference
+# proc: Quick Reference
 
-## Installation
+See [README.md](README.md) for formats and details.
+
+## Setup
+
 ```powershell
-.\Install-ProcDrive.ps1 -Install
+.\Install-ProcDrive.ps1 -Install -AddToProfile    # install, mount now and in new sessions
+.\Install-ProcDrive.ps1 -Uninstall -RemoveFiles   # remove everything
+Mount-ProcDrive / Dismount-ProcDrive              # after Import-Module ProcFileSystem
 ```
 
-## Navigation Commands
+## Files
 
-| Command | Description |
-|---------|-------------|
-| `cd proc:` | Navigate to proc drive |
-| `ls` | List current directory |
-| `cd net` | Change to network directory |
-| `cd ..` | Go up one level |
-| `pwd` | Show current location |
-
-## Common Files
-
-### System Info
-```powershell
-cat cpuinfo          # CPU details
-cat meminfo          # Memory stats
-cat version          # OS version
-cat uptime           # System uptime (seconds)
-cat loadavg          # Load average
-cat stat             # System statistics
+```text
+cpuinfo  meminfo  stat  loadavg  uptime  version  cmdline
+mounts   filesystems  swaps  partitions  modules
+net\dev  net\route  net\arp  net\tcp  net\tcp6  net\udp  net\udp6
+sys\kernel\hostname  sys\kernel\ostype  sys\kernel\osrelease  sys\kernel\version
+devices\block  devices\character
+<PID>\cmdline  <PID>\status  <PID>\stat  <PID>\environ  <PID>\maps   (also self\)
 ```
 
-### Network
+## The one rule
+
+Each file comes back as **one string**; `-Raw` isn't supported. Split it to get lines:
+
 ```powershell
-cat net\dev          # Network interface stats
-cat net\route        # Routing table
-cat net\arp          # ARP cache
-cat net\tcp          # TCP connections
-cat net\udp          # UDP endpoints
+$lines = (cat proc:\meminfo) -split "`r?`n"
 ```
 
-### System Config
+## One-liners
+
 ```powershell
-cat sys\kernel\hostname    # Computer name
-cat sys\kernel\ostype      # OS type
-cat sys\kernel\osrelease   # OS version
-cat sys\kernel\version     # Full version string
+# Available memory, GB
+[long](((cat proc:\meminfo) -split "`r?`n" | Select-String '^MemAvailable').Line -replace '\D') / 1MB
+
+# Logical CPUs
+@((cat proc:\cpuinfo) -split "`r?`n" | Select-String '^processor').Count
+
+# CPU model
+(((cat proc:\cpuinfo) -split "`r?`n" | Select-String '^model name' | Select-Object -First 1).Line -split ':\s*', 2)[1]
+
+# Uptime, hours
+[math]::Round([double]((cat proc:\uptime).Split()[0]) / 3600, 1)
+
+# Load averages
+(cat proc:\loadavg).Split()[0..2]
+
+# Process IDs
+(ls proc:\ | ? Name -match '^\d+$').Name
+
+# Name and RSS of a process (stat fields 2 and 24)
+$f = (cat proc:\self\stat) -split ' '; "$($f[1]) $([long]$f[23] * 4) kB"
+
+# Parent of a process (stat field 4)
+((cat proc:\self\stat) -split ' ')[3]
+
+# argv of a process
+(cat proc:\self\cmdline).TrimEnd("`0") -split "`0"
+
+# Established IPv4 TCP connections (state 01)
+@((cat proc:\net\tcp) -split "`r?`n" | ? { ($_.Trim() -split '\s+')[3] -eq '01' }).Count
+
+# Interface names
+(cat proc:\net\dev) -split "`r?`n" | Select-Object -Skip 2 | ? { $_ } | % { $_.Split(':')[0].Trim() }
 ```
 
-### Storage
+## Decoding net\tcp addresses
+
 ```powershell
-cat mounts           # Mounted drives
-cat swaps            # Page file usage
-cat partitions       # Disk partitions
-cat filesystems      # Supported filesystems
-```
-
-### Processes
-```powershell
-cat self\status      # Current process status
-cat self\cmdline     # Current process command line
-cat <PID>\status     # Specific process status
-cat <PID>\cmdline    # Specific process command line
-cat <PID>\stat       # Process statistics
-```
-
-## Useful One-Liners
-
-### Memory Usage
-```powershell
-# Get free memory in GB
-[math]::Round([int]((cat proc:\meminfo | Select-String 'MemFree').ToString().Split()[1]) / 1MB, 2)
-
-# Calculate memory usage percentage
-$m = cat proc:\meminfo | ConvertFrom-StringData -Delimiter ':'
-100 - ([int]$m.MemFree.Trim().Split()[0] / [int]$m.MemTotal.Trim().Split()[0] * 100)
-```
-
-### CPU Information
-```powershell
-# Count logical processors
-((cat proc:\cpuinfo -Raw) -split 'processor\s+:').Count - 1
-
-# Get CPU model
-(cat proc:\cpuinfo | Select-String 'model name' -List).ToString().Split(':')[1].Trim()
-```
-
-### Network Stats
-```powershell
-# Count active TCP connections
-((cat proc:\net\tcp) -split "`n" | Select -Skip 1 | ? {$_.Trim()}).Count
-
-# List network interfaces
-(cat proc:\net\dev) -split "`n" | Select -Skip 2 | ? {$_.Trim()} | % {$_.Split(':')[0].Trim()}
-```
-
-### Process Queries
-```powershell
-# List all process IDs
-ls proc:\ | ? Name -match '^\d+$' | Select -Expand Name
-
-# Count running processes
-(ls proc:\ | ? Name -match '^\d+$').Count
-
-# Find PowerShell processes
-ls proc:\ | ? Name -match '^\d+$' | % {
-    $s = cat "$($_.FullName)\status" -Raw
-    if ($s -match 'pwsh') { $_.Name }
+function ConvertFrom-ProcHex4($hex) {   # 0100007F -> 127.0.0.1
+    ([ipaddress][byte[]](6, 4, 2, 0 | % { [Convert]::ToByte($hex.Substring($_, 2), 16) })).ToString()
 }
+$f = (((cat proc:\net\tcp) -split "`r?`n")[1].Trim() -split '\s+')[1].Split(':')
+"$(ConvertFrom-ProcHex4 $f[0]):$([Convert]::ToInt32($f[1], 16))"
 ```
 
-### System Uptime
-```powershell
-# Uptime in hours
-[math]::Round((cat proc:\uptime).Split()[0] / 3600, 2)
-
-# Uptime in days
-[math]::Round((cat proc:\uptime).Split()[0] / 86400, 2)
-
-# Boot time
-[DateTimeOffset]::FromUnixTimeSeconds([int](cat proc:\stat | Select-String 'btime').ToString().Split()[1])
-```
-
-## PowerShell Integration
-
-### Filtering
-```powershell
-# Search cpuinfo for specific field
-cat proc:\cpuinfo | Select-String 'cache size'
-
-# Get specific meminfo value
-cat proc:\meminfo | Select-String 'SwapTotal'
-```
-
-### Conversion
-```powershell
-# Convert meminfo to object
-$mem = @{}
-(cat proc:\meminfo) -split "`n" | % {
-    if ($_ -match '^(\w+):\s+(\d+)') {
-        $mem[$Matches[1]] = [int]$Matches[2]
-    }
-}
-$mem.MemTotal
-```
-
-### Monitoring
-```powershell
-# Watch memory (requires custom Watch function or loop)
-while ($true) {
-    Clear-Host
-    cat proc:\meminfo
-    Start-Sleep -Seconds 5
-}
-```
-
-## Comparison with Get-* Cmdlets
-
-| proc: | PowerShell Equivalent |
-|-------|----------------------|
-| `cat cpuinfo` | `Get-CimInstance Win32_Processor` |
-| `cat meminfo` | `Get-CimInstance Win32_OperatingSystem` |
-| `cat net\tcp` | `Get-NetTCPConnection` |
-| `cat net\dev` | `Get-NetAdapterStatistics` |
-| `ls | ? Name -match '^\d+$'` | `Get-Process` |
-
-## Tips
-
-1. **Caching**: Most files are cached for performance. Use `ls -Force` to refresh
-2. **Process Dirs**: Process directories update dynamically
-3. **Wildcards**: Standard PowerShell wildcards work: `ls proc:\*info`
-4. **Tab Completion**: Tab completion works in proc: drive
-5. **Pipes**: Combine with PowerShell pipelines for powerful queries
-
-## Common Patterns
-
-### System Dashboard
-```powershell
-[PSCustomObject]@{
-    Hostname = (cat proc:\sys\kernel\hostname).Trim()
-    Uptime = "$([math]::Round((cat proc:\uptime).Split()[0] / 3600, 1)) hours"
-    Processes = (ls proc:\ | ? Name -match '^\d+$').Count
-    MemoryGB = [math]::Round([int]((cat proc:\meminfo | Select-String 'MemTotal').ToString().Split()[1]) / 1MB, 1)
-    TCPConns = ((cat proc:\net\tcp) -split "`n" | Select -Skip 1 | ? {$_.Trim()}).Count
-}
-```
-
-### Process Explorer
-```powershell
-ls proc:\ | ? Name -match '^\d+$' | % {
-    $status = cat "$($_.FullName)\status" -Raw
-    $name = ($status -split "`n" | Select-String 'Name:').ToString().Split("`t")[-1]
-    $vm = ($status -split "`n" | Select-String 'VmSize:').ToString().Split("`t")[-1]
-    [PSCustomObject]@{ PID = $_.Name; Name = $name; Memory = $vm }
-} | Sort Memory -Descending | Select -First 10
-```
-
-### Network Monitor
-```powershell
-while ($true) {
-    $tcp = ((cat proc:\net\tcp) -split "`n" | Select -Skip 1 | ? {$_.Trim()}).Count
-    $udp = ((cat proc:\net\udp) -split "`n" | Select -Skip 1 | ? {$_.Trim()}).Count
-    Clear-Host
-    Write-Host "TCP: $tcp | UDP: $udp" -ForegroundColor Cyan
-    Start-Sleep 2
-}
-```
+TCP states: `01` established, `02` syn-sent, `03` syn-recv, `04`/`05` fin-wait, `06`
+time-wait, `07` close, `08` close-wait, `09` last-ack, `0A` listen, `0B` closing.
 
 ## Troubleshooting
 
-| Issue | Solution |
-|-------|----------|
-| Drive not found | Run `.\Install-ProcDrive.ps1 -Install` |
-| Permission denied | Run PowerShell as Administrator |
-| Slow performance | Some WMI queries take time; be patient |
-| Empty directories | Check if process still exists |
-| Module errors | Ensure PowerShell 7+ and SHiPS installed |
-
-## Resources
-
-- Full documentation: See README.md
-- Examples: `.\Install-ProcDrive.ps1 -ShowExamples`
-- Tests: `.\Test-ProcDrive.ps1 -RunTests`
-- Demo: `.\Test-ProcDrive.ps1 -Demo`
+| Symptom | Cause / fix |
+|---|---|
+| `proc:` gone after running a script | Use `Mount-ProcDrive` (global), not `New-PSDrive` |
+| `A parameter cannot be found that matches parameter name 'Raw'` | Drop `-Raw`; content is already one string |
+| `Unable to find type [SHiPSDirectory]` | SHiPS isn't installed: `Install-Module SHiPS -Scope CurrentUser` |
+| Reading `<PID>\environ` fails | Only `self\environ` is readable |
+| Slow `cpuinfo` | `Win32_Processor` takes about a second; expected |

@@ -29,7 +29,7 @@ AfterAll {
     Dismount-ProcDrive
 }
 
-Describe 'Module' -Skip:(-not $IsWin) {
+Describe 'Module' {
     It 'has a valid manifest that requires SHiPS' {
         $m = Test-ModuleManifest (Join-Path (Split-Path $PSScriptRoot -Parent) 'ProcFileSystem.psd1')
         $m.RequiredModules.Name | Should -Contain 'SHiPS'
@@ -44,6 +44,32 @@ Describe 'Module' -Skip:(-not $IsWin) {
         & { & { Mount-ProcDrive } }
         { Mount-ProcDrive } | Should -Not -Throw
         Get-PSDrive -Name proc -Scope Global -ErrorAction SilentlyContinue | Should -Not -BeNullOrEmpty
+    }
+}
+
+# On Linux proc: is just the real /proc; these check the mapping, not procfs itself.
+Describe 'Linux' -Skip:$IsWin {
+    It 'maps proc: onto /proc with the FileSystem provider' {
+        $d = Get-PSDrive -Name proc -Scope Global
+        $d.Provider.Name | Should -Be 'FileSystem'
+        $d.Root | Should -Be '/proc'
+    }
+
+    It 'reads proc:\<PID>\stat with Windows-style backslashes' {
+        # Compare pid, comm, state and ppid only: CPU times tick between two reads.
+        $viaDrive = ((Get-Content "proc:\$PID\stat") -split ' ')[0..3]
+        $direct = ((Get-Content "/proc/$PID/stat") -split ' ')[0..3]
+        $viaDrive | Should -Be $direct
+        $viaDrive[1] | Should -Be '(pwsh)'
+    }
+
+    It 'resolves self to this process' {
+        (Get-Content proc:\self\stat) -split ' ' | Select-Object -First 1 | Should -Be "$PID"
+    }
+
+    It 'supports the documented cross-platform idioms' {
+        ((Get-Content proc:\meminfo) -split "`r?`n" | Select-String '^MemAvailable').Line | Should -Match 'kB$'
+        (Get-Content proc:\self\cmdline).TrimEnd("`0") -split "`0" | Should -Contain '-NoProfile'
     }
 }
 

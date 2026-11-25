@@ -4,7 +4,7 @@
     Installs, mounts or removes the PowerShell proc: drive.
 .DESCRIPTION
     -Install copies the module into your CurrentUser module path (so it can be imported
-    by name, which SHiPS relies on), imports it, and mounts proc: in the global scope so
+    by name, which SHiPS relies on). On Linux proc: maps to the real /proc, imports it, and mounts proc: in the global scope so
     the drive survives after this script returns. -AddToProfile also mounts it in every
     new session.
 .EXAMPLE
@@ -23,13 +23,18 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $ModuleName   = 'ProcFileSystem'
-$ModuleRoot   = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'PowerShell\Modules'
+# CurrentUser module path: Documents\PowerShell\Modules on Windows; on Linux MyDocuments is
+# empty, and the user path is ~/.local/share/powershell/Modules (first PSModulePath entry).
+$ModuleRoot   = if ($IsWindows) {
+    Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'PowerShell\Modules'
+} else {
+    ($env:PSModulePath -split [IO.Path]::PathSeparator)[0]
+}
 $ProfilePath  = $PROFILE.CurrentUserAllHosts
 $ProfileStart = '# >>> ProcFileSystem >>>'
 $ProfileEnd   = '# <<< ProcFileSystem <<<'
 
 function Install-ProcDrive {
-    if (-not $IsWindows) { throw 'The proc: drive only works on Windows.' }
     Write-Host 'Installing PowerShell proc: drive...' -ForegroundColor Cyan
 
     if (-not (Get-Module -ListAvailable -Name SHiPS)) {
@@ -64,7 +69,7 @@ function Install-ProcDrive {
 function Add-ProfileBlock {
     $block = @"
 $ProfileStart
-if (`$IsWindows -and (Get-Module -ListAvailable -Name $ModuleName)) {
+if (Get-Module -ListAvailable -Name $ModuleName) {
     Import-Module $ModuleName
     Mount-ProcDrive
 }

@@ -49,6 +49,22 @@ Use `Mount-ProcDrive` rather than `New-PSDrive` from scripts and functions:
 `New-PSDrive` defaults to the caller's local scope, so a drive created inside a script
 disappears when the script returns.
 
+## On Linux
+
+An Easter egg, since Linux already has the real thing: the same install works under
+PowerShell 7 on Linux, where `proc:` maps straight onto `/proc`.
+
+```powershell
+./Install-ProcDrive.ps1 -Install       # installs to ~/.local/share/powershell/Modules
+cat proc:\4\stat                        # reads /proc/4/stat; \ and / both work
+```
+
+SHiPS is still required (the Windows provider's classes have to load), but it isn't
+used. Two differences from Windows: you get every file Linux has, and `Get-Content`
+returns an array of lines rather than one string (`-Raw` works too). The idioms below,
+such as `-split "`r?`n"`, splitting `stat` after the last `)`, and `TrimEnd("`0")`,
+behave the same on both.
+
 ## Reading files
 
 **Each file is returned as one string.** `Get-Content -Raw` is not supported by the
@@ -238,7 +254,9 @@ Requires Python 3 with matplotlib and numpy (`pip install matplotlib numpy`);
 ## Status and remaining work
 
 Tested on Windows 11 Pro (build 26300), PowerShell 7.6.10, SHiPS 0.8.1 and Pester 6.2.0:
-66 tests pass, elevated and under a restricted (Basic User) token. Still to do:
+66 tests pass, elevated and under a restricted (Basic User) token. The Linux mapping is
+tested in the `mcr.microsoft.com/powershell` container (PowerShell 7.4.2, Ubuntu 22.04):
+7 tests pass. Still to do:
 
 **Testing gaps**
 - Not yet run as an ordinary standard (non-admin, UAC-filtered) user. The test machine's

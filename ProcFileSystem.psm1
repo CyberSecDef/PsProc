@@ -16,8 +16,160 @@ if (-not $IsWindows) {
     throw 'ProcFileSystem requires Windows: it reads CIM, performance counters and the NetTCPIP cmdlets.'
 }
 
+#region Helpers
+# Native helpers. Class bodies need their types at parse time, so classes never touch
+# [ProcFs.Native] directly; they call the module functions below, which resolve it at
+# runtime. (SHiPS runs class methods in its own runspace, where module functions are
+# still visible.)
+if (-not ('ProcFs.Native' -as [type])) {
+    Add-Type -Namespace ProcFs -Name Native -MemberDefinition @'
+[DllImport("shell32.dll", SetLastError = true)]
+static extern IntPtr CommandLineToArgvW([MarshalAs(UnmanagedType.LPWStr)] string lpCmdLine, out int pNumArgs);
+[DllImport("kernel32.dll")]
+static extern IntPtr LocalFree(IntPtr hMem);
+
+// Split a Windows command line exactly the way the C runtime builds argv.
+public static string[] SplitCommandLine(string commandLine) {
+    int argc;
+    IntPtr argv = CommandLineToArgvW(commandLine, out argc);
+    if (argv == IntPtr.Zero) throw new System.ComponentModel.Win32Exception();
+    try {
+        var args = new string[argc];
+        for (int i = 0; i < argc; i++) args[i] = Marshal.PtrToStringUni(Marshal.ReadIntPtr(argv, i * IntPtr.Size));
+        return args;
+    } finally { LocalFree(argv); }
+}
+
+[DllImport("kernel32.dll", SetLastError = true)]
+static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+[DllImport("kernel32.dll")]
+static extern bool CloseHandle(IntPtr hObject);
+[DllImport("ntdll.dll")]
+static extern int NtQueryInformationProcess(IntPtr hProcess, int infoClass, IntPtr info, int infoLength, out int returnLength);
+const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+
+// Parent PID via ProcessBasicInformation (class 0). Needs only limited query access,
+// so it works for protected processes and never touches WMI. -1 if unavailable.
+public static int GetParentProcessId(int pid) {
+    IntPtr h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+    if (h == IntPtr.Zero) return -1;
+    try {
+        // PROCESS_BASIC_INFORMATION is six pointer-sized fields; the parent is the sixth.
+        int size = IntPtr.Size * 6;
+        IntPtr buf = Marshal.AllocHGlobal(size);
+        try {
+            int ret;
+            if (NtQueryInformationProcess(h, 0, buf, size, out ret) != 0) return -1;
+            return (int)Marshal.ReadIntPtr(buf, IntPtr.Size * 5).ToInt64();
+        } finally { Marshal.FreeHGlobal(buf); }
+    } finally { CloseHandle(h); }
+}
+
+// Command line via ProcessCommandLineInformation (class 60, Windows 8.1+). Returns null
+// when access is denied instead of waiting on a WMI query.
+public static string GetCommandLine(int pid) {
+    IntPtr h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+    if (h == IntPtr.Zero) return null;
+    try {
+        int len;
+        NtQueryInformationProcess(h, 60, IntPtr.Zero, 0, out len);
+        if (len <= 0) return null;
+        IntPtr buf = Marshal.AllocHGlobal(len);
+        try {
+            if (NtQueryInformationProcess(h, 60, buf, len, out len) != 0) return null;
+            // UNICODE_STRING { USHORT Length; USHORT MaximumLength; PWSTR Buffer; }
+            int bytes = Marshal.ReadInt16(buf) & 0xFFFF;
+            IntPtr text = Marshal.ReadIntPtr(buf, IntPtr.Size);
+            return bytes == 0 ? "" : Marshal.PtrToStringUni(text, bytes / 2);
+        } finally { Marshal.FreeHGlobal(buf); }
+    } finally { CloseHandle(h); }
+}
+'@
+}
+
+function Get-ProcProperty {
+    # Many Process properties throw, or return $null, for protected processes and for
+    # Idle/System when not elevated. Return $Default instead of failing the whole read.
+    param([System.Diagnostics.Process]$Process, [string]$Name, $Default = $null)
+    try { $value = $Process.$Name } catch { $value = $null }
+    if ($null -eq $value) { $Default } else { $value }
+}
+
+function Get-ProcBootTime {
+    # From the millisecond tick counter rather than CIM: no WMI round trip, and it works
+    # under restricted tokens where WMI is denied.
+    [datetime]::Now.AddMilliseconds(-[Environment]::TickCount64)
+}
+
+function Get-ProcTicks {
+    # Linux reports CPU times in clock ticks (USER_HZ = 100). TimeSpan ticks are 100 ns.
+    param([TimeSpan]$Time)
+    [long]($Time.Ticks / 100000)
+}
+
+function Get-ProcState {
+    # Windows has no process state; derive one from the threads like Linux would:
+    # any running/ready thread -> R, every thread suspended -> T, otherwise S.
+    param([System.Diagnostics.Process]$Process)
+    $threads = Get-ProcProperty $Process 'Threads'
+    if (-not $threads -or $threads.Count -eq 0) { return 'S (sleeping)' }
+    $suspended = 0
+    foreach ($t in $threads) {
+        $state = try { [string]$t.ThreadState } catch { '' }
+        if ($state -in 'Running', 'Ready', 'Standby') { return 'R (running)' }
+        if ($state -eq 'Wait') {
+            $reason = try { [string]$t.WaitReason } catch { '' }
+            if ($reason -eq 'Suspended') { $suspended++ }
+        }
+    }
+    if ($suspended -eq $threads.Count) { 'T (stopped)' } else { 'S (sleeping)' }
+}
+
+function Get-ProcNice {
+    # Map the Windows priority class onto the Linux nice range (-20..19).
+    param([System.Diagnostics.Process]$Process)
+    switch ([string](Get-ProcProperty $Process 'PriorityClass' 'Normal')) {
+        'Idle'        { 19 }
+        'BelowNormal' { 10 }
+        'AboveNormal' { -5 }
+        'High'        { -10 }
+        'RealTime'    { -20 }
+        default       { 0 }
+    }
+}
+
+function Get-ProcComm {
+    # Linux truncates comm to TASK_COMM_LEN - 1 = 15 characters.
+    param([System.Diagnostics.Process]$Process)
+    $name = [string](Get-ProcProperty $Process 'ProcessName' '')
+    if ($name.Length -gt 15) { $name.Substring(0, 15) } else { $name }
+}
+
+function Get-ProcParentId {
+    # Not Process.Parent: in PowerShell 7 that runs a per-process Win32_Process CIM
+    # query, which takes ~5 s to fail on every process a non-elevated user can't open.
+    param([System.Diagnostics.Process]$Process)
+    [math]::Max(0, [ProcFs.Native]::GetParentProcessId($Process.Id))
+}
+
+function Get-ProcCommandLine {
+    # Not Process.CommandLine, for the same ~5 s-per-process CIM reason as above.
+    param([System.Diagnostics.Process]$Process)
+    [ProcFs.Native]::GetCommandLine($Process.Id)
+}
+
+function Split-ProcCommandLine {
+    param([string]$CommandLine)
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) { return @() }
+    [ProcFs.Native]::SplitCommandLine($CommandLine)
+}
+#endregion
+
 #region Root Directory
-[SHiPSProvider(UseCache = $true)]
+# Not cached: the root holds the live PID directories. With UseCache = $true, processes
+# started after the first listing stayed invisible (and exited ones lingered) until
+# 'ls -Force'. Rebuilding the static entries each time is cheap.
+[SHiPSProvider(UseCache = $false)]
 class ProcRoot : SHiPSDirectory {
     ProcRoot([string]$name) : base($name) {}
     
@@ -52,7 +204,6 @@ class ProcRoot : SHiPSDirectory {
 #endregion
 
 #region CPU Info
-[SHiPSProvider(UseCache = $true)]
 class ProcCpuInfo : SHiPSLeaf {
     ProcCpuInfo([string]$name) : base($name) {}
     
@@ -90,7 +241,6 @@ class ProcCpuInfo : SHiPSLeaf {
 #endregion
 
 #region Memory Info
-[SHiPSProvider(UseCache = $true)]
 class ProcMemInfo : SHiPSLeaf {
     ProcMemInfo([string]$name) : base($name) {}
     
@@ -127,7 +277,6 @@ class ProcMemInfo : SHiPSLeaf {
 #endregion
 
 #region Version
-[SHiPSProvider(UseCache = $true)]
 class ProcVersion : SHiPSLeaf {
     ProcVersion([string]$name) : base($name) {}
     
@@ -139,7 +288,6 @@ class ProcVersion : SHiPSLeaf {
 #endregion
 
 #region Uptime
-[SHiPSProvider(UseCache = $false)]
 class ProcUptime : SHiPSLeaf {
     ProcUptime([string]$name) : base($name) {}
     
@@ -160,7 +308,6 @@ class ProcUptime : SHiPSLeaf {
 #endregion
 
 #region Load Average
-[SHiPSProvider(UseCache = $false)]
 class ProcLoadAvg : SHiPSLeaf {
     ProcLoadAvg([string]$name) : base($name) {}
     
@@ -179,7 +326,6 @@ class ProcLoadAvg : SHiPSLeaf {
 #endregion
 
 #region Stat
-[SHiPSProvider(UseCache = $false)]
 class ProcStat : SHiPSLeaf {
     ProcStat([string]$name) : base($name) {}
     
@@ -226,7 +372,6 @@ class ProcStat : SHiPSLeaf {
 #endregion
 
 #region Mounts
-[SHiPSProvider(UseCache = $true)]
 class ProcMounts : SHiPSLeaf {
     ProcMounts([string]$name) : base($name) {}
     
@@ -247,7 +392,6 @@ class ProcMounts : SHiPSLeaf {
 #endregion
 
 #region Cmdline
-[SHiPSProvider(UseCache = $true)]
 class ProcCmdline : SHiPSLeaf {
     ProcCmdline([string]$name) : base($name) {}
     
@@ -260,7 +404,6 @@ class ProcCmdline : SHiPSLeaf {
 #endregion
 
 #region Filesystems
-[SHiPSProvider(UseCache = $true)]
 class ProcFilesystems : SHiPSLeaf {
     ProcFilesystems([string]$name) : base($name) {}
     
@@ -278,7 +421,6 @@ class ProcFilesystems : SHiPSLeaf {
 #endregion
 
 #region Swaps
-[SHiPSProvider(UseCache = $true)]
 class ProcSwaps : SHiPSLeaf {
     ProcSwaps([string]$name) : base($name) {}
     
@@ -301,7 +443,6 @@ class ProcSwaps : SHiPSLeaf {
 #endregion
 
 #region Partitions
-[SHiPSProvider(UseCache = $true)]
 class ProcPartitions : SHiPSLeaf {
     ProcPartitions([string]$name) : base($name) {}
     
@@ -321,7 +462,6 @@ class ProcPartitions : SHiPSLeaf {
 #endregion
 
 #region Modules
-[SHiPSProvider(UseCache = $true)]
 class ProcModules : SHiPSLeaf {
     ProcModules([string]$name) : base($name) {}
     
@@ -570,36 +710,24 @@ class ProcDevicesChar : SHiPSLeaf {
 }
 #endregion
 
-#region Self Directory
-[SHiPSProvider(UseCache = $false)]
-class ProcSelfDirectory : SHiPSDirectory {
-    ProcSelfDirectory([string]$name) : base($name) {}
-    
-    [object[]] GetChildItem() {
-        return @(
-            [ProcProcessCmdline]::new('cmdline', $global:PID)
-            [ProcProcessStatus]::new('status', $global:PID)
-            [ProcProcessStat]::new('stat', $global:PID)
-            [ProcProcessEnviron]::new('environ', $global:PID)
-        )
-    }
-}
-#endregion
-
 #region Process Directories
 [SHiPSProvider(UseCache = $false)]
 class ProcProcessDirectory : SHiPSDirectory {
     hidden [int]$ProcessId
-    
+
     ProcProcessDirectory([string]$name) : base($name) {
         $this.ProcessId = [int]$name
     }
-    
+
+    ProcProcessDirectory([string]$name, [int]$procid) : base($name) {
+        $this.ProcessId = $procid
+    }
+
     [object[]] GetChildItem() {
         if (-not (Get-Process -Id $this.ProcessId -ErrorAction SilentlyContinue)) {
             return @()
         }
-        
+
         return @(
             [ProcProcessCmdline]::new('cmdline', $this.ProcessId)
             [ProcProcessStatus]::new('status', $this.ProcessId)
@@ -610,114 +738,150 @@ class ProcProcessDirectory : SHiPSDirectory {
     }
 }
 
+# /proc/self: the same entries as /proc/<PID> for the current PowerShell process.
+[SHiPSProvider(UseCache = $false)]
+class ProcSelfDirectory : ProcProcessDirectory {
+    ProcSelfDirectory([string]$name) : base($name, $global:PID) {}
+}
+
 class ProcProcessCmdline : SHiPSLeaf {
     hidden [int]$ProcessId
-    
+
     ProcProcessCmdline([string]$name, [int]$procid) : base($name) {
         $this.ProcessId = $procid
     }
-    
+
+    # Linux format: argv joined by NUL with a trailing NUL. The Windows command line is
+    # split with CommandLineToArgvW, so quoted arguments containing spaces stay intact.
+    # Processes whose command line can't be read (protected, Idle, System) are empty,
+    # like Linux kernel threads.
     [string] GetContent() {
         $process = Get-Process -Id $this.ProcessId -ErrorAction SilentlyContinue
-        if ($process) {
-            $cmdline = $process.CommandLine
-            if ($cmdline) {
-                return $cmdline -replace ' ', "`0"
-            }
-            return $process.Path
-        }
-        return ""
+        if (-not $process) { return '' }
+        $argv = Split-ProcCommandLine (Get-ProcCommandLine $process)
+        if ($argv.Count -eq 0) { return '' }
+        return ($argv -join "`0") + "`0"
     }
 }
 
 class ProcProcessStatus : SHiPSLeaf {
     hidden [int]$ProcessId
-    
+
     ProcProcessStatus([string]$name, [int]$procid) : base($name) {
         $this.ProcessId = $procid
     }
-    
+
     [string] GetContent() {
         $process = Get-Process -Id $this.ProcessId -ErrorAction SilentlyContinue
-        if ($process) {
-            $sb = [System.Text.StringBuilder]::new()
-            [void]$sb.AppendLine("Name:`t$($process.ProcessName)")
-            [void]$sb.AppendLine("State:`tR (running)")
-            [void]$sb.AppendLine("Pid:`t$($process.Id)")
-            [void]$sb.AppendLine("PPid:`t$($process.Parent.Id)")
-            [void]$sb.AppendLine("Threads:`t$($process.Threads.Count)")
-            [void]$sb.AppendLine("VmSize:`t$([math]::Round($process.WorkingSet64 / 1KB)) kB")
-            [void]$sb.AppendLine("VmRSS:`t$([math]::Round($process.WorkingSet64 / 1KB)) kB")
-            return $sb.ToString()
-        }
-        return ""
+        if (-not $process) { return '' }
+        $kB = { param($bytes) "$([math]::Round([double]$bytes / 1KB)) kB" }
+        $threads = Get-ProcProperty $process 'Threads'
+        $sb = [System.Text.StringBuilder]::new()
+        [void]$sb.AppendLine("Name:`t$(Get-ProcComm $process)")
+        [void]$sb.AppendLine("State:`t$(Get-ProcState $process)")
+        [void]$sb.AppendLine("Tgid:`t$($process.Id)")
+        [void]$sb.AppendLine("Pid:`t$($process.Id)")
+        [void]$sb.AppendLine("PPid:`t$(Get-ProcParentId $process)")
+        [void]$sb.AppendLine("VmPeak:`t$(& $kB (Get-ProcProperty $process 'PeakVirtualMemorySize64' 0))")
+        [void]$sb.AppendLine("VmSize:`t$(& $kB (Get-ProcProperty $process 'VirtualMemorySize64' 0))")
+        [void]$sb.AppendLine("VmHWM:`t$(& $kB (Get-ProcProperty $process 'PeakWorkingSet64' 0))")
+        [void]$sb.AppendLine("VmRSS:`t$(& $kB (Get-ProcProperty $process 'WorkingSet64' 0))")
+        [void]$sb.AppendLine("VmData:`t$(& $kB (Get-ProcProperty $process 'PrivateMemorySize64' 0))")
+        [void]$sb.AppendLine("Threads:`t$(if ($threads) { $threads.Count } else { 0 })")
+        return $sb.ToString()
     }
 }
 
 class ProcProcessStat : SHiPSLeaf {
     hidden [int]$ProcessId
-    
+
     ProcProcessStat([string]$name, [int]$procid) : base($name) {
         $this.ProcessId = $procid
     }
-    
+
+    # All 52 fields of Linux /proc/<pid>/stat, in order (see proc(5)). Fields Windows has
+    # no equivalent for are 0. Mappings: session = Windows session id, priority = 20+nice
+    # (from the priority class), starttime = clock ticks since boot, rss = 4 KiB pages.
     [string] GetContent() {
         $process = Get-Process -Id $this.ProcessId -ErrorAction SilentlyContinue
-        if ($process) {
-            $state = 'R'
-            $ppid = if ($process.Parent) { $process.Parent.Id } else { 0 }
-            $priority = $process.BasePriority
-            $threads = $process.Threads.Count
-            $startTime = [DateTimeOffset]$process.StartTime
-            
-            return "$($process.Id) ($($process.ProcessName)) $state $ppid 0 0 0 0 0 0 0 0 0 0 $priority 0 $threads 0 $($startTime.ToUnixTimeSeconds())"
-        }
-        return ""
+        if (-not $process) { return '' }
+
+        $start = Get-ProcProperty $process 'StartTime'
+        $startTicks = if ($start) { [long][math]::Max(0, ($start - (Get-ProcBootTime)).TotalSeconds * 100) } else { 0 }
+        $nice = Get-ProcNice $process
+        $threads = Get-ProcProperty $process 'Threads'
+
+        $fields = [System.Collections.Generic.List[object]]::new()
+        $fields.AddRange([object[]]@(
+            $process.Id                                                      # 1  pid
+            "($(Get-ProcComm $process))"                                     # 2  comm
+            (Get-ProcState $process).Substring(0, 1)                         # 3  state
+            (Get-ProcParentId $process)                                      # 4  ppid
+            $process.Id                                                      # 5  pgrp
+            (Get-ProcProperty $process 'SessionId' 0)                        # 6  session
+            0, -1, 0                                                         # 7  tty_nr, 8 tpgid, 9 flags
+            0, 0, 0, 0                                                       # 10-13 minflt cminflt majflt cmajflt
+            (Get-ProcTicks (Get-ProcProperty $process 'UserProcessorTime' ([TimeSpan]::Zero)))        # 14 utime
+            (Get-ProcTicks (Get-ProcProperty $process 'PrivilegedProcessorTime' ([TimeSpan]::Zero)))  # 15 stime
+            0, 0                                                             # 16 cutime, 17 cstime
+            (20 + $nice), $nice                                              # 18 priority, 19 nice
+            $(if ($threads) { $threads.Count } else { 0 })                   # 20 num_threads
+            0                                                                # 21 itrealvalue
+            $startTicks                                                      # 22 starttime
+            (Get-ProcProperty $process 'VirtualMemorySize64' 0)              # 23 vsize (bytes)
+            [long]((Get-ProcProperty $process 'WorkingSet64' 0) / 4096)      # 24 rss (pages)
+            '18446744073709551615'                                           # 25 rsslim (unlimited)
+        ))
+        while ($fields.Count -lt 52) { $fields.Add(0) }                      # 26-52
+        return $fields -join ' '
     }
 }
 
 class ProcProcessEnviron : SHiPSLeaf {
     hidden [int]$ProcessId
-    
+
     ProcProcessEnviron([string]$name, [int]$procid) : base($name) {
         $this.ProcessId = $procid
     }
-    
+
     [string] GetContent() {
-        # Windows doesn't easily expose other process environments
-        # Return current process environment if it's our PID
-        if ($this.ProcessId -eq $global:PID) {
-            $sb = [System.Text.StringBuilder]::new()
-            foreach ($var in Get-ChildItem Env:) {
-                [void]$sb.Append("$($var.Name)=$($var.Value)`0")
-            }
-            return $sb.ToString()
+        # Only our own environment is readable. Like Linux reading another user's
+        # environ, anything else is an access error rather than fake content.
+        if ($this.ProcessId -ne $global:PID) {
+            throw [System.UnauthorizedAccessException]::new("Reading the environment of process $($this.ProcessId) is not supported; only /proc/self/environ is readable.")
         }
-        return "Access denied"
+        $sb = [System.Text.StringBuilder]::new()
+        foreach ($var in Get-ChildItem Env:) {
+            [void]$sb.Append("$($var.Name)=$($var.Value)`0")
+        }
+        return $sb.ToString()
     }
 }
 
 class ProcProcessMaps : SHiPSLeaf {
     hidden [int]$ProcessId
-    
+
     ProcProcessMaps([string]$name, [int]$procid) : base($name) {
         $this.ProcessId = $procid
     }
-    
+
+    # One line per loaded module, in Linux format: "start-end perms offset dev inode path"
+    # with bare lowercase hex addresses. Windows only exposes module images, not every
+    # mapping, so heaps and stacks are absent.
     [string] GetContent() {
         $process = Get-Process -Id $this.ProcessId -ErrorAction SilentlyContinue
-        if ($process) {
-            $sb = [System.Text.StringBuilder]::new()
-            
-            foreach ($module in $process.Modules) {
-                $baseAddr = "0x{0:x16}" -f $module.BaseAddress.ToInt64()
-                $endAddr = "0x{0:x16}" -f ($module.BaseAddress.ToInt64() + $module.ModuleMemorySize)
-                [void]$sb.AppendLine("$baseAddr-$endAddr r-xp 00000000 00:00 0    $($module.FileName)")
-            }
-            
-            return $sb.ToString()
+        if (-not $process) { return '' }
+        try {
+            $modules = $process.Modules
+        } catch {
+            throw [System.UnauthorizedAccessException]::new("Cannot read the modules of process $($this.ProcessId): $($_.Exception.InnerException.Message)")
         }
-        return ""
+        $sb = [System.Text.StringBuilder]::new()
+        foreach ($module in $modules) {
+            $base = $module.BaseAddress.ToInt64()
+            [void]$sb.AppendLine(('{0:x}-{1:x} r-xp 00000000 00:00 0                          {2}' -f $base, ($base + $module.ModuleMemorySize), $module.FileName))
+        }
+        return $sb.ToString()
     }
 }
 #endregion

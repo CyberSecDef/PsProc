@@ -245,6 +245,44 @@ function ConvertTo-ProcMountPath {
     param([string]$Path)
     $Path -replace ' ', '\040' -replace "`t", '\011' -replace "`n", '\012'
 }
+
+function ConvertTo-ProcHexAddress {
+    # Linux /proc/net prints addresses as the raw in-memory words in hex: IPv4 as one
+    # little-endian 32-bit word (127.0.0.1 -> 0100007F), IPv6 as four such words.
+    param([string]$Address)
+    $bytes = [System.Net.IPAddress]::Parse($Address).GetAddressBytes()
+    $sb = [System.Text.StringBuilder]::new()
+    for ($i = 0; $i -lt $bytes.Length; $i += 4) {
+        for ($j = 3; $j -ge 0; $j--) { [void]$sb.Append($bytes[$i + $j].ToString('X2')) }
+    }
+    $sb.ToString()
+}
+
+function ConvertTo-ProcHexMask {
+    # IPv4 netmask for a prefix length, in the same little-endian hex as the addresses.
+    param([int]$PrefixLength)
+    # (4294967295, not 0xFFFFFFFF: PowerShell parses that hex literal as Int32 -1.)
+    $mask = if ($PrefixLength -le 0) { [uint64]0 } else { ([uint64]4294967295 -shl (32 - $PrefixLength)) -band [uint64]4294967295 }
+    $b = [byte[]]@((($mask -shr 24) -band 0xFF), (($mask -shr 16) -band 0xFF), (($mask -shr 8) -band 0xFF), ($mask -band 0xFF))
+    ConvertTo-ProcHexAddress ([System.Net.IPAddress]::new($b)).IPAddressToString
+}
+
+function Get-ProcTcpState {
+    # Windows TCP state -> Linux TCP_* code. Bound (bound but not listening/connected)
+    # appears on Linux as CLOSE.
+    param([string]$State)
+    switch ($State) {
+        'Established' { '01' } 'SynSent'   { '02' } 'SynReceived' { '03' } 'FinWait1'  { '04' }
+        'FinWait2'    { '05' } 'TimeWait'  { '06' } 'CloseWait'   { '08' } 'LastAck'   { '09' }
+        'Listen'      { '0A' } 'Closing'   { '0B' } default        { '07' }
+    }
+}
+
+function Format-ProcSocketLine {
+    param([int]$Index, [string]$LocalAddress, [int]$LocalPort, [string]$RemoteAddress, [int]$RemotePort, [string]$State)
+    '{0,4}: {1}:{2:X4} {3}:{4:X4} {5} 00000000:00000000 00:00000000 00000000     0        0 0' -f $Index,
+        (ConvertTo-ProcHexAddress $LocalAddress), $LocalPort, (ConvertTo-ProcHexAddress $RemoteAddress), $RemotePort, $State
+}
 #endregion
 
 #region Root Directory
@@ -599,128 +637,137 @@ class ProcModules : SHiPSLeaf {
 #endregion
 
 #region Net Directory
+# Every file here uses the exact Linux layout (proc(5)), so existing parsers work.
 [SHiPSProvider(UseCache = $true)]
 class ProcNetDirectory : SHiPSDirectory {
     ProcNetDirectory([string]$name) : base($name) {}
-    
+
     [object[]] GetChildItem() {
         return @(
             [ProcNetDev]::new('dev')
             [ProcNetRoute]::new('route')
             [ProcNetArp]::new('arp')
-            [ProcNetTcp]::new('tcp')
-            [ProcNetUdp]::new('udp')
+            [ProcNetTcp]::new('tcp', 4)
+            [ProcNetTcp]::new('tcp6', 6)
+            [ProcNetUdp]::new('udp', 4)
+            [ProcNetUdp]::new('udp6', 6)
         )
     }
 }
 
 class ProcNetDev : SHiPSLeaf {
     ProcNetDev([string]$name) : base($name) {}
-    
+
+    # Interface names are printed in full: truncating them to 6 characters made
+    # "Ethernet" and "Ethernet 2" indistinguishable.
     [string] GetContent() {
         $sb = [System.Text.StringBuilder]::new()
-        [void]$sb.AppendLine("Inter-|   Receive                                                |  Transmit")
-        [void]$sb.AppendLine(" face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed")
-        
-        $adapters = Get-NetAdapterStatistics
-        foreach ($adapter in $adapters) {
-            $name = $adapter.Name.PadRight(6).Substring(0, 6)
-            $rxBytes = $adapter.ReceivedBytes
-            $rxPackets = $adapter.ReceivedUnicastPackets
-            $txBytes = $adapter.SentBytes
-            $txPackets = $adapter.SentUnicastPackets
-            
-            [void]$sb.AppendLine("$name`: $rxBytes $rxPackets 0 0 0 0 0 0 $txBytes $txPackets 0 0 0 0 0 0")
+        [void]$sb.AppendLine('Inter-|   Receive                                                |  Transmit')
+        [void]$sb.AppendLine(' face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed')
+        foreach ($a in Get-NetAdapterStatistics) {
+            $rxPackets = [long]$a.ReceivedUnicastPackets + [long]$a.ReceivedMulticastPackets + [long]$a.ReceivedBroadcastPackets
+            $txPackets = [long]$a.SentUnicastPackets + [long]$a.SentMulticastPackets + [long]$a.SentBroadcastPackets
+            [void]$sb.AppendLine(('{0,6}: {1,7} {2,7} {3,4} {4,4} {5,4} {6,5} {7,10} {8,9} {9,8} {10,7} {11,4} {12,4} {13,4} {14,5} {15,7} {16,10}' -f
+                $a.Name, $a.ReceivedBytes, $rxPackets, $a.ReceivedPacketErrors, $a.ReceivedDiscardedPackets, 0, 0, 0, $a.ReceivedMulticastPackets,
+                $a.SentBytes, $txPackets, $a.OutboundPacketErrors, $a.OutboundDiscardedPackets, 0, 0, 0, 0))
         }
-        
         return $sb.ToString()
     }
 }
 
 class ProcNetRoute : SHiPSLeaf {
     ProcNetRoute([string]$name) : base($name) {}
-    
+
+    # IPv4 routes from the active store only (without -PolicyStore, Get-NetRoute also
+    # returns persistent routes a second time). Flags: RTF_UP 0x1, RTF_GATEWAY 0x2, RTF_HOST 0x4. Metric is the
+    # effective metric Windows uses (route metric + interface metric).
     [string] GetContent() {
         $sb = [System.Text.StringBuilder]::new()
         [void]$sb.AppendLine("Iface`tDestination`tGateway `tFlags`tRefCnt`tUse`tMetric`tMask`t`tMTU`tWindow`tIRTT")
-        
-        $routes = Get-NetRoute -AddressFamily IPv4
-        foreach ($route in $routes) {
-            $iface = $route.InterfaceAlias
-            $dest = $route.DestinationPrefix.Split('/')[0]
-            $gateway = if ($route.NextHop -eq '0.0.0.0') { '0.0.0.0' } else { $route.NextHop }
-            $metric = $route.RouteMetric
-            
-            [void]$sb.AppendLine("$iface`t$dest`t$gateway`t0003`t0`t0`t$metric`t0.0.0.0`t0`t0`t0")
+        foreach ($r in Get-NetRoute -AddressFamily IPv4 -PolicyStore ActiveStore -ErrorAction SilentlyContinue) {
+            $dest, $prefix = $r.DestinationPrefix.Split('/')
+            $flags = 0x1
+            if ($r.NextHop -and $r.NextHop -ne '0.0.0.0') { $flags = $flags -bor 0x2 }
+            if ([int]$prefix -eq 32) { $flags = $flags -bor 0x4 }
+            $gateway = if ($r.NextHop) { $r.NextHop } else { '0.0.0.0' }
+            $metric = [int]$r.RouteMetric + [int]$r.InterfaceMetric
+            [void]$sb.AppendLine(("{0}`t{1}`t{2}`t{3:X4}`t0`t0`t{4}`t{5}`t0`t0`t0" -f $r.InterfaceAlias,
+                (ConvertTo-ProcHexAddress $dest), (ConvertTo-ProcHexAddress $gateway), $flags, $metric,
+                (ConvertTo-ProcHexMask ([int]$prefix))))
         }
-        
         return $sb.ToString()
     }
 }
 
 class ProcNetArp : SHiPSLeaf {
     ProcNetArp([string]$name) : base($name) {}
-    
+
+    # Flags: 0x2 complete (ATF_COM), 0x6 permanent (ATF_PERM | ATF_COM), 0x0 incomplete.
+    # Multicast/broadcast pseudo-entries and failed (Unreachable) lookups are left out,
+    # as Linux does not list them.
     [string] GetContent() {
         $sb = [System.Text.StringBuilder]::new()
-        [void]$sb.AppendLine("IP address       HW type     Flags       HW address            Mask     Device")
-        
-        $neighbors = Get-NetNeighbor -AddressFamily IPv4
-        foreach ($neighbor in $neighbors) {
-            $ip = $neighbor.IPAddress.PadRight(16)
-            $mac = $neighbor.LinkLayerAddress
-            $iface = $neighbor.InterfaceAlias
-            
-            [void]$sb.AppendLine("$ip 0x1         0x2         $mac     *        $iface")
+        [void]$sb.AppendLine('IP address       HW type     Flags       HW address            Mask     Device')
+        foreach ($n in Get-NetNeighbor -AddressFamily IPv4 -ErrorAction SilentlyContinue) {
+            $state = [string]$n.State
+            if ($state -eq 'Unreachable') { continue }
+            if ($n.InterfaceAlias -like 'Loopback*') { continue }
+            $mac = ([string]$n.LinkLayerAddress).Replace('-', ':').ToLowerInvariant()
+            if ($mac -like '01:00:5e:*' -or $mac -eq 'ff:ff:ff:ff:ff:ff') { continue }
+            if (-not $mac) { $mac = '00:00:00:00:00:00' }
+            $flags = switch ($state) { 'Permanent' { '0x6' } 'Incomplete' { '0x0' } default { '0x2' } }
+            [void]$sb.AppendLine(('{0,-16} {1,-11} {2,-11} {3,-17}     {4,-8} {5}' -f $n.IPAddress, '0x1', $flags, $mac, '*', $n.InterfaceAlias))
         }
-        
         return $sb.ToString()
     }
 }
 
 class ProcNetTcp : SHiPSLeaf {
-    ProcNetTcp([string]$name) : base($name) {}
-    
+    hidden [int]$Family
+
+    ProcNetTcp([string]$name, [int]$family) : base($name) {
+        $this.Family = $family
+    }
+
     [string] GetContent() {
         $sb = [System.Text.StringBuilder]::new()
-        [void]$sb.AppendLine("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode")
-        
-        $connections = Get-NetTCPConnection
-        $index = 0
-        foreach ($conn in $connections) {
-            $localAddr = "$($conn.LocalAddress):$($conn.LocalPort)"
-            $remoteAddr = "$($conn.RemoteAddress):$($conn.RemotePort)"
-            $state = switch ($conn.State) {
-                'Listen' { '0A' }
-                'Established' { '01' }
-                'TimeWait' { '06' }
-                default { '00' }
-            }
-            
-            [void]$sb.AppendLine("  $($index.ToString().PadLeft(2)): $localAddr $remoteAddr $state 00000000:00000000 00:00000000 00000000     0        0 0")
-            $index++
+        if ($this.Family -eq 6) {
+            [void]$sb.AppendLine('  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode')
+        } else {
+            [void]$sb.AppendLine('  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode')
         }
-        
+        $i = 0
+        foreach ($c in Get-NetTCPConnection -ErrorAction SilentlyContinue | Sort-Object LocalPort) {
+            if (([string]$c.LocalAddress).Contains(':') -ne ($this.Family -eq 6)) { continue }
+            [void]$sb.AppendLine((Format-ProcSocketLine $i $c.LocalAddress $c.LocalPort $c.RemoteAddress $c.RemotePort (Get-ProcTcpState $c.State)))
+            $i++
+        }
         return $sb.ToString()
     }
 }
 
 class ProcNetUdp : SHiPSLeaf {
-    ProcNetUdp([string]$name) : base($name) {}
-    
+    hidden [int]$Family
+
+    ProcNetUdp([string]$name, [int]$family) : base($name) {
+        $this.Family = $family
+    }
+
+    # UDP sockets are unconnected, so remote is zero and the state is 07 (CLOSE), as on Linux.
     [string] GetContent() {
         $sb = [System.Text.StringBuilder]::new()
-        [void]$sb.AppendLine("  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode")
-        
-        $connections = Get-NetUDPEndpoint
-        $index = 0
-        foreach ($conn in $connections) {
-            $localAddr = "$($conn.LocalAddress):$($conn.LocalPort)"
-            
-            [void]$sb.AppendLine("  $($index.ToString().PadLeft(2)): $localAddr 0.0.0.0:0 07 00000000:00000000 00:00000000 00000000     0        0 0")
-            $index++
+        if ($this.Family -eq 6) {
+            [void]$sb.AppendLine('  sl  local_address                         remote_address                        st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode')
+        } else {
+            [void]$sb.AppendLine('  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode')
         }
-        
+        $any = if ($this.Family -eq 6) { '::' } else { '0.0.0.0' }
+        $i = 0
+        foreach ($e in Get-NetUDPEndpoint -ErrorAction SilentlyContinue | Sort-Object LocalPort) {
+            if (([string]$e.LocalAddress).Contains(':') -ne ($this.Family -eq 6)) { continue }
+            [void]$sb.AppendLine((Format-ProcSocketLine $i $e.LocalAddress $e.LocalPort $any 0 '07'))
+            $i++
+        }
         return $sb.ToString()
     }
 }

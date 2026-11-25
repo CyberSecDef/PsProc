@@ -84,8 +84,58 @@ public static string GetCommandLine(int pid) {
         } finally { Marshal.FreeHGlobal(buf); }
     } finally { CloseHandle(h); }
 }
+
+[DllImport("kernel32.dll", SetLastError = true)]
+static extern bool GetSystemTimes(out long idleTime, out long kernelTime, out long userTime);
+[DllImport("kernel32.dll")]
+public static extern bool IsProcessorFeaturePresent(uint feature);
+
+// Idle, kernel (which includes idle) and user time summed over all CPUs, in 100 ns units.
+public static long[] SystemTimes() {
+    long idle, kernel, user;
+    if (!GetSystemTimes(out idle, out kernel, out user)) throw new System.ComponentModel.Win32Exception();
+    return new long[] { idle, kernel, user };
+}
+
+// Load average. Windows keeps no run-queue average, so sample CPU demand (busy fraction
+// x CPU count, i.e. "CPUs' worth of work") every 5 s and apply the same exponential
+// decay Linux uses for its 1/5/15-minute averages. The first sample seeds all three.
+static System.Threading.Timer loadTimer;
+static readonly object loadLock = new object();
+static readonly double[] loadAvg = new double[3];
+static readonly double[] loadDecay = { Math.Exp(-5.0 / 60), Math.Exp(-5.0 / 300), Math.Exp(-5.0 / 900) };
+static long lastIdle, lastBusy;
+static bool loadSeeded;
+
+public static void StartLoadSampler() {
+    lock (loadLock) {
+        if (loadTimer != null) return;
+        long idle, kernel, user;
+        GetSystemTimes(out idle, out kernel, out user);
+        lastIdle = idle; lastBusy = (kernel - idle) + user;
+        loadTimer = new System.Threading.Timer(_ => SampleLoad(), null, 1000, 5000);
+    }
+}
+
+static void SampleLoad() {
+    long idle, kernel, user;
+    if (!GetSystemTimes(out idle, out kernel, out user)) return;
+    long busy = (kernel - idle) + user;
+    lock (loadLock) {
+        double dBusy = busy - lastBusy, dTotal = dBusy + (idle - lastIdle);
+        lastIdle = idle; lastBusy = busy;
+        if (dTotal <= 0) return;
+        double demand = Environment.ProcessorCount * dBusy / dTotal;
+        for (int i = 0; i < 3; i++)
+            loadAvg[i] = loadSeeded ? loadAvg[i] * loadDecay[i] + demand * (1 - loadDecay[i]) : demand;
+        loadSeeded = true;
+    }
+}
+
+public static double[] LoadAverage() { lock (loadLock) { return (double[])loadAvg.Clone(); } }
 '@
 }
+[ProcFs.Native]::StartLoadSampler()
 
 function Get-ProcProperty {
     # Many Process properties throw, or return $null, for protected processes and for
@@ -163,6 +213,38 @@ function Split-ProcCommandLine {
     if ([string]::IsNullOrWhiteSpace($CommandLine)) { return @() }
     [ProcFs.Native]::SplitCommandLine($CommandLine)
 }
+
+function Get-ProcSystemTimes { [ProcFs.Native]::SystemTimes() }
+function Get-ProcLoadAverage { [ProcFs.Native]::LoadAverage() }
+
+function Get-ProcCpuFlags {
+    # Linux /proc/cpuinfo flag names for the features Windows reports through
+    # IsProcessorFeaturePresent (PF_* constants from winnt.h).
+    # (A list of pairs, not [ordered]@{}: an int indexer on an ordered dictionary is
+    # positional, so $map[3] would return the fourth entry rather than key 3.)
+    $map = @(@(3, 'mmx'), @(6, 'sse'), @(8, 'tsc'), @(9, 'pae'), @(10, 'sse2'), @(12, 'nx'), @(13, 'pni'),
+             @(14, 'cx16'), @(17, 'xsave'), @(28, 'rdrand'), @(32, 'rdtscp'), @(36, 'ssse3'),
+             @(37, 'sse4_1'), @(38, 'sse4_2'), @(39, 'avx'), @(40, 'avx2'), @(41, 'avx512f'))
+    $flags = foreach ($pair in $map) { if ([ProcFs.Native]::IsProcessorFeaturePresent($pair[0])) { $pair[1] } }
+    if ([Environment]::Is64BitOperatingSystem) { $flags = @('fpu') + $flags + 'lm' }
+    $flags -join ' '
+}
+
+function Get-ProcRunnable {
+    # Approximates Linux's procs_running (running + runnable): threads waiting in the
+    # ready queue plus the number of CPUs' worth of work currently executing.
+    $queue = (Get-CimInstance -ClassName Win32_PerfRawData_PerfOS_System).ProcessorQueueLength
+    $busy = (Get-CimInstance -ClassName Win32_PerfFormattedData_PerfOS_Processor -Filter "Name = '_Total'").PercentProcessorTime
+    [int]$queue + [int][math]::Round([Environment]::ProcessorCount * $busy / 100)
+}
+
+function ConvertTo-ProcMountPath {
+    # /proc/mounts escapes whitespace as octal so lines can be split on spaces. Linux also
+    # escapes backslash (\134), but every Windows path is full of them, so they are left
+    # as-is to keep the file readable.
+    param([string]$Path)
+    $Path -replace ' ', '\040' -replace "`t", '\011' -replace "`n", '\012'
+}
 #endregion
 
 #region Root Directory
@@ -206,35 +288,42 @@ class ProcRoot : SHiPSDirectory {
 #region CPU Info
 class ProcCpuInfo : SHiPSLeaf {
     ProcCpuInfo([string]$name) : base($name) {}
-    
+
     [string] GetContent() {
         $sb = [System.Text.StringBuilder]::new()
-        $processors = Get-CimInstance -ClassName Win32_Processor
-        
+        $flags = Get-ProcCpuFlags
         $processorNum = 0
-        foreach ($cpu in $processors) {
-            $cores = $cpu.NumberOfCores
-            $logicalProcessors = $cpu.NumberOfLogicalProcessors
-            
-            for ($i = 0; $i -lt $logicalProcessors; $i++) {
+        $socket = 0
+        foreach ($cpu in Get-CimInstance -ClassName Win32_Processor) {
+            # Win32_Processor.Family is a WMI enum code (e.g. 107) and there is no Model
+            # property; the real CPUID values are in Description:
+            # "AMD64 Family 25 Model 80 Stepping 0".
+            $family = $model = $stepping = 0
+            if ($cpu.Description -match 'Family (\d+) Model (\d+) Stepping (\d+)') {
+                $family, $model, $stepping = $Matches[1], $Matches[2], $Matches[3]
+            }
+            $cores = [int]$cpu.NumberOfCores
+            $logical = [int]$cpu.NumberOfLogicalProcessors
+            $threadsPerCore = [math]::Max(1, $logical / [math]::Max(1, $cores))
+            for ($i = 0; $i -lt $logical; $i++) {
                 [void]$sb.AppendLine("processor`t: $processorNum")
                 [void]$sb.AppendLine("vendor_id`t: $($cpu.Manufacturer)")
-                [void]$sb.AppendLine("cpu family`t: $($cpu.Family)")
-                [void]$sb.AppendLine("model`t`t: $($cpu.Model)")
-                [void]$sb.AppendLine("model name`t: $($cpu.Name)")
-                [void]$sb.AppendLine("stepping`t: $($cpu.Stepping)")
-                [void]$sb.AppendLine("cpu MHz`t`t: $($cpu.CurrentClockSpeed)")
+                [void]$sb.AppendLine("cpu family`t: $family")
+                [void]$sb.AppendLine("model`t`t: $model")
+                [void]$sb.AppendLine("model name`t: $($cpu.Name.Trim())")
+                [void]$sb.AppendLine("stepping`t: $stepping")
+                [void]$sb.AppendLine("cpu MHz`t`t: $($cpu.CurrentClockSpeed).000")
                 [void]$sb.AppendLine("cache size`t: $($cpu.L3CacheSize) KB")
-                [void]$sb.AppendLine("physical id`t: $($cpu.DeviceID)")
-                [void]$sb.AppendLine("siblings`t: $logicalProcessors")
-                [void]$sb.AppendLine("core id`t`t: $([Math]::Floor($i / ($logicalProcessors / $cores)))")
+                [void]$sb.AppendLine("physical id`t: $socket")
+                [void]$sb.AppendLine("siblings`t: $logical")
+                [void]$sb.AppendLine("core id`t`t: $([math]::Floor($i / $threadsPerCore))")
                 [void]$sb.AppendLine("cpu cores`t: $cores")
-                [void]$sb.AppendLine("flags`t`t: $($cpu.Architecture)")
+                [void]$sb.AppendLine("flags`t`t: $flags")
                 [void]$sb.AppendLine()
                 $processorNum++
             }
+            $socket++
         }
-        
         return $sb.ToString()
     }
 }
@@ -243,34 +332,45 @@ class ProcCpuInfo : SHiPSLeaf {
 #region Memory Info
 class ProcMemInfo : SHiPSLeaf {
     ProcMemInfo([string]$name) : base($name) {}
-    
+
+    # Windows -> Linux mapping:
+    #   MemFree      free + zeroed page lists (truly unused pages)
+    #   MemAvailable Available Bytes (free + standby: what can be handed out without paging)
+    #   Cached       the standby lists, Windows' equivalent of the page cache
+    #   Dirty        the modified page list (written-to pages not yet flushed)
+    #   Slab         kernel pools; SReclaimable = paged pool, SUnreclaim = non-paged pool
+    #   Swap*        page files only (TotalVirtualMemorySize is RAM + page file)
+    #   CommitLimit / Committed_AS   commit limit and committed bytes
     [string] GetContent() {
-        $os = Get-CimInstance -ClassName Win32_OperatingSystem
-        $cs = Get-CimInstance -ClassName Win32_ComputerSystem
-        
-        $totalMem = [math]::Round($cs.TotalPhysicalMemory / 1KB)
-        $freeMem = [math]::Round($os.FreePhysicalMemory)
-        $availableMem = [math]::Round($os.FreePhysicalMemory)
-        $usedMem = $totalMem - $freeMem
-        
-        $totalSwap = [math]::Round($os.TotalVirtualMemorySize)
-        $freeSwap = [math]::Round($os.FreeVirtualMemory)
-        
+        $mem = Get-CimInstance -ClassName Win32_PerfRawData_PerfOS_Memory
+        $total = (Get-CimInstance -ClassName Win32_ComputerSystem).TotalPhysicalMemory
+        $swapTotal = $swapUsed = 0
+        foreach ($pf in Get-CimInstance -ClassName Win32_PageFileUsage) {
+            $swapTotal += [long]$pf.AllocatedBaseSize * 1MB
+            $swapUsed += [long]$pf.CurrentUsage * 1MB
+        }
+        $standby = [long]$mem.StandbyCacheCoreBytes + [long]$mem.StandbyCacheNormalPriorityBytes + [long]$mem.StandbyCacheReserveBytes
+        $rows = [ordered]@{
+            MemTotal     = $total
+            MemFree      = $mem.FreeAndZeroPageListBytes
+            MemAvailable = $mem.AvailableBytes
+            Buffers      = 0
+            Cached       = $standby
+            SwapCached   = 0
+            SwapTotal    = $swapTotal
+            SwapFree     = $swapTotal - $swapUsed
+            Dirty        = $mem.ModifiedPageListBytes
+            Shmem        = 0
+            Slab         = [long]$mem.PoolPagedBytes + [long]$mem.PoolNonpagedBytes
+            SReclaimable = $mem.PoolPagedBytes
+            SUnreclaim   = $mem.PoolNonpagedBytes
+            CommitLimit  = $mem.CommitLimit
+            Committed_AS = $mem.CommittedBytes
+        }
         $sb = [System.Text.StringBuilder]::new()
-        [void]$sb.AppendLine("MemTotal:       $totalMem kB")
-        [void]$sb.AppendLine("MemFree:        $freeMem kB")
-        [void]$sb.AppendLine("MemAvailable:   $availableMem kB")
-        [void]$sb.AppendLine("Buffers:        0 kB")
-        [void]$sb.AppendLine("Cached:         0 kB")
-        [void]$sb.AppendLine("SwapTotal:      $totalSwap kB")
-        [void]$sb.AppendLine("SwapFree:       $freeSwap kB")
-        [void]$sb.AppendLine("Dirty:          0 kB")
-        [void]$sb.AppendLine("Writeback:      0 kB")
-        [void]$sb.AppendLine("Mapped:         0 kB")
-        [void]$sb.AppendLine("Shmem:          0 kB")
-        [void]$sb.AppendLine("CommitLimit:    $totalSwap kB")
-        [void]$sb.AppendLine("Committed_AS:   $usedMem kB")
-        
+        foreach ($key in $rows.Keys) {
+            [void]$sb.AppendLine(('{0,-15} {1,8} kB' -f "$($key):", [long]([double]$rows[$key] / 1KB)))
+        }
         return $sb.ToString()
     }
 }
@@ -279,7 +379,7 @@ class ProcMemInfo : SHiPSLeaf {
 #region Version
 class ProcVersion : SHiPSLeaf {
     ProcVersion([string]$name) : base($name) {}
-    
+
     [string] GetContent() {
         $os = Get-CimInstance -ClassName Win32_OperatingSystem
         return "$($os.Caption) (build $($os.BuildNumber)) $($os.OSArchitecture) $($os.Version)"
@@ -290,19 +390,12 @@ class ProcVersion : SHiPSLeaf {
 #region Uptime
 class ProcUptime : SHiPSLeaf {
     ProcUptime([string]$name) : base($name) {}
-    
+
+    # "<seconds since boot> <idle seconds summed over all CPUs>", as on Linux.
     [string] GetContent() {
-        $os = Get-CimInstance -ClassName Win32_OperatingSystem
-        $uptime = (Get-Date) - $os.LastBootUpTime
-        $uptimeSeconds = [math]::Round($uptime.TotalSeconds, 2)
-        
-        # Idle time is harder to calculate accurately on Windows
-        # Using a placeholder based on CPU idle percentage
-        $cpu = Get-CimInstance -ClassName Win32_Processor | Select-Object -First 1
-        $idlePercent = 100 - ($cpu.LoadPercentage)
-        $idleSeconds = [math]::Round($uptimeSeconds * ($idlePercent / 100), 2)
-        
-        return "$uptimeSeconds $idleSeconds"
+        $uptime = [Environment]::TickCount64 / 1000.0
+        $idle = (Get-ProcSystemTimes)[0] / 1e7
+        return [string]::Format([cultureinfo]::InvariantCulture, '{0:F2} {1:F2}', $uptime, $idle)
     }
 }
 #endregion
@@ -310,17 +403,25 @@ class ProcUptime : SHiPSLeaf {
 #region Load Average
 class ProcLoadAvg : SHiPSLeaf {
     ProcLoadAvg([string]$name) : base($name) {}
-    
+
+    # "<1m> <5m> <15m> <runnable>/<total threads> <newest pid>". The averages are of CPU
+    # demand, sampled every 5 s from module load (see StartLoadSampler); Windows has no
+    # run-queue average. Windows PIDs are not sequential, so the last field is the PID of
+    # the most recently started process rather than the highest one.
     [string] GetContent() {
-        # Windows doesn't have direct load average, simulate with CPU usage
-        $cpu = Get-CimInstance -ClassName Win32_Processor
-        $avgLoad = ($cpu | Measure-Object -Property LoadPercentage -Average).Average / 100
-        
-        $processes = (Get-Process).Count
-        $threads = (Get-Process | Measure-Object -Property Threads -Sum).Sum
-        
-        # Format: load1 load5 load15 running/total lastPID
-        return "$($avgLoad.ToString('F2')) $($avgLoad.ToString('F2')) $($avgLoad.ToString('F2')) 1/$processes $threads"
+        $avg = Get-ProcLoadAverage
+        $processes = Get-Process
+        $threads = 0
+        $newest = $null
+        foreach ($p in $processes) {
+            $t = Get-ProcProperty $p 'Threads'
+            if ($t) { $threads += $t.Count }
+            $start = Get-ProcProperty $p 'StartTime'
+            if ($start -and (-not $newest -or $start -gt $newest.Start)) { $newest = @{ Id = $p.Id; Start = $start } }
+        }
+        $inv = [cultureinfo]::InvariantCulture
+        return [string]::Format($inv, '{0:F2} {1:F2} {2:F2} {3}/{4} {5}', $avg[0], $avg[1], $avg[2],
+            (Get-ProcRunnable), $threads, $(if ($newest) { $newest.Id } else { 0 }))
     }
 }
 #endregion
@@ -328,44 +429,45 @@ class ProcLoadAvg : SHiPSLeaf {
 #region Stat
 class ProcStat : SHiPSLeaf {
     ProcStat([string]$name) : base($name) {}
-    
+
+    # Cumulative counters since boot, as on Linux, so tools can diff two reads.
+    # CPU columns are clock ticks (USER_HZ = 100) from the raw processor counters
+    # (100 ns units). Windows' privileged time includes interrupt and DPC time, so
+    # system = privileged - interrupt - DPC; irq = interrupt, softirq = DPC.
     [string] GetContent() {
-        $sb = [System.Text.StringBuilder]::new()
-        
-        # CPU stats
-        $cpuTimes = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfOS_Processor | 
-            Where-Object { $_.Name -eq '_Total' }
-        
-        $user = [math]::Round($cpuTimes.PercentUserTime * 100)
-        $system = [math]::Round($cpuTimes.PercentPrivilegedTime * 100)
-        $idle = [math]::Round($cpuTimes.PercentIdleTime * 100)
-        
-        [void]$sb.AppendLine("cpu  $user 0 $system $idle 0 0 0 0 0 0")
-        
-        # Per-CPU stats
-        $cpuStats = Get-CimInstance -ClassName Win32_PerfFormattedData_PerfOS_Processor | 
-            Where-Object { $_.Name -ne '_Total' }
-        
-        $cpuNum = 0
-        foreach ($cpu in $cpuStats) {
-            $u = [math]::Round($cpu.PercentUserTime * 100)
-            $s = [math]::Round($cpu.PercentPrivilegedTime * 100)
-            $i = [math]::Round($cpu.PercentIdleTime * 100)
-            [void]$sb.AppendLine("cpu$cpuNum $u 0 $s $i 0 0 0 0 0 0")
-            $cpuNum++
+        # Instances are "N", or "group,N" on systems with more than 64 logical CPUs (which
+        # also have per-group "_Total" instances); order them by group, then number.
+        $cpus = Get-CimInstance -ClassName Win32_PerfRawData_PerfOS_Processor |
+            Where-Object Name -notlike '*_Total' |
+            Sort-Object { [int](($_.Name -split ',')[0]) }, { [int](($_.Name -split ',')[-1]) }
+        $lines = [System.Collections.Generic.List[string]]::new()
+        $sum = [long[]]::new(7)
+        $intr = 0L
+        foreach ($cpu in $cpus) {
+            $user = [long]($cpu.PercentUserTime / 1e5)
+            $irq = [long]($cpu.PercentInterruptTime / 1e5)
+            $soft = [long]($cpu.PercentDPCTime / 1e5)
+            $system = [math]::Max(0, [long]($cpu.PercentPrivilegedTime / 1e5) - $irq - $soft)
+            $idle = [long]($cpu.PercentIdleTime / 1e5)
+            $vals = [long[]]@($user, 0, $system, $idle, 0, $irq, $soft)
+            for ($i = 0; $i -lt 7; $i++) { $sum[$i] += $vals[$i] }
+            $intr += [long]$cpu.InterruptsPersec
+            $lines.Add("cpu$($lines.Count) $($vals -join ' ') 0 0 0")
         }
-        
-        # System stats
-        $os = Get-CimInstance -ClassName Win32_OperatingSystem
-        $bootTime = [DateTimeOffset]$os.LastBootUpTime
-        
-        [void]$sb.AppendLine("intr 0")
-        [void]$sb.AppendLine("ctxt 0")
-        [void]$sb.AppendLine("btime $($bootTime.ToUnixTimeSeconds())")
-        [void]$sb.AppendLine("processes $(Get-Process | Measure-Object | Select-Object -ExpandProperty Count)")
-        [void]$sb.AppendLine("procs_running 1")
+        $sys = Get-CimInstance -ClassName Win32_PerfRawData_PerfOS_System
+        $btime = [DateTimeOffset]::new((Get-ProcBootTime)).ToUnixTimeSeconds()
+
+        $sb = [System.Text.StringBuilder]::new()
+        [void]$sb.AppendLine("cpu  $($sum -join ' ') 0 0 0")
+        foreach ($l in $lines) { [void]$sb.AppendLine($l) }
+        [void]$sb.AppendLine("intr $intr")
+        [void]$sb.AppendLine("ctxt $($sys.ContextSwitchesPersec)")
+        [void]$sb.AppendLine("btime $btime")
+        # Linux counts forks since boot; Windows has no such counter, so this is the
+        # current process count.
+        [void]$sb.AppendLine("processes $($sys.Processes)")
+        [void]$sb.AppendLine("procs_running $(Get-ProcRunnable)")
         [void]$sb.AppendLine("procs_blocked 0")
-        
         return $sb.ToString()
     }
 }
@@ -374,18 +476,26 @@ class ProcStat : SHiPSLeaf {
 #region Mounts
 class ProcMounts : SHiPSLeaf {
     ProcMounts([string]$name) : base($name) {}
-    
+
+    # "<device> <mount point> <fstype> <options> 0 0". Local volumes use their volume
+    # GUID path as the device; mapped network drives use the UNC share and type cifs.
     [string] GetContent() {
-        $sb = [System.Text.StringBuilder]::new()
-        
-        Get-PSDrive -PSProvider FileSystem | ForEach-Object {
-            $drive = $_
-            $fsType = "ntfs"
-            $options = "rw"
-            
-            [void]$sb.AppendLine("$($drive.Name): $($drive.Root) $fsType $options 0 0")
+        $volumes = @{}
+        foreach ($v in Get-CimInstance -ClassName Win32_Volume) {
+            if ($v.DriveLetter) { $volumes[$v.DriveLetter] = $v.DeviceID.TrimEnd('\') }
         }
-        
+        $sb = [System.Text.StringBuilder]::new()
+        foreach ($disk in Get-CimInstance -ClassName Win32_LogicalDisk) {
+            if (-not $disk.FileSystem) { continue }   # empty card reader / optical drive
+            if ($disk.DriveType -eq 4) {
+                $device = $disk.ProviderName; $type = 'cifs'
+            } else {
+                $device = if ($volumes[$disk.DeviceID]) { $volumes[$disk.DeviceID] } else { $disk.DeviceID }
+                $type = $disk.FileSystem.ToLowerInvariant()
+            }
+            $options = if ($disk.Access -eq 1) { 'ro' } else { 'rw' }
+            [void]$sb.AppendLine("$(ConvertTo-ProcMountPath $device) $(ConvertTo-ProcMountPath "$($disk.DeviceID)\") $type $options 0 0")
+        }
         return $sb.ToString()
     }
 }
@@ -394,11 +504,12 @@ class ProcMounts : SHiPSLeaf {
 #region Cmdline
 class ProcCmdline : SHiPSLeaf {
     ProcCmdline([string]$name) : base($name) {}
-    
+
+    # Linux /proc/cmdline is the kernel boot command line. The Windows equivalent is the
+    # boot loader options, which the kernel records in SystemStartOptions.
     [string] GetContent() {
-        # Return the command line of the current PowerShell process
-        $currentProc = Get-Process -Id $global:PID
-        return $currentProc.Path
+        $options = (Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control' -Name SystemStartOptions -ErrorAction SilentlyContinue).SystemStartOptions
+        return (([string]$options).Trim() -replace '\s+', ' ') + "`n"
     }
 }
 #endregion
@@ -406,15 +517,21 @@ class ProcCmdline : SHiPSLeaf {
 #region Filesystems
 class ProcFilesystems : SHiPSLeaf {
     ProcFilesystems([string]$name) : base($name) {}
-    
+
+    # Filesystem drivers currently loaded in the kernel, with Linux names where one exists.
+    # "nodev" marks filesystems that are not backed by a block device.
     [string] GetContent() {
+        $known = [ordered]@{
+            'Ntfs' = "`tntfs"; 'ReFS' = "`trefs"; 'fastfat' = "`tvfat"; 'exfat' = "`texfat"
+            'udfs' = "`tudf"; 'cdfs' = "`tiso9660"; 'Npfs' = "nodev`tnpfs"; 'Msfs' = "nodev`tmsfs"
+            'rdbss' = "nodev`tcifs"; 'MRxDAV' = "nodev`twebdav"; 'P9Rdr' = "nodev`t9p"
+        }
+        $running = @{}
+        foreach ($d in Get-CimInstance -ClassName Win32_SystemDriver -Filter "State = 'Running'") { $running[$d.Name] = $true }
         $sb = [System.Text.StringBuilder]::new()
-        [void]$sb.AppendLine("nodev`tsysfs")
-        [void]$sb.AppendLine("nodev`ttmpfs")
-        [void]$sb.AppendLine("nodev`tdevtmpfs")
-        [void]$sb.AppendLine("`tntfs")
-        [void]$sb.AppendLine("`tfat32")
-        [void]$sb.AppendLine("`texfat")
+        foreach ($name in $known.Keys) {
+            if ($running[$name]) { [void]$sb.AppendLine($known[$name]) }
+        }
         return $sb.ToString()
     }
 }
@@ -423,20 +540,15 @@ class ProcFilesystems : SHiPSLeaf {
 #region Swaps
 class ProcSwaps : SHiPSLeaf {
     ProcSwaps([string]$name) : base($name) {}
-    
+
     [string] GetContent() {
         $sb = [System.Text.StringBuilder]::new()
-        [void]$sb.AppendLine("Filename`t`t`t`tType`t`tSize`tUsed`tPriority")
-        
-        $os = Get-CimInstance -ClassName Win32_OperatingSystem
-        $pageFiles = Get-CimInstance -ClassName Win32_PageFileUsage
-        
-        foreach ($pf in $pageFiles) {
-            $size = $pf.AllocatedBaseSize * 1024
-            $used = $pf.CurrentUsage * 1024
-            [void]$sb.AppendLine("$($pf.Name)`t`tfile`t`t$size`t$used`t-2")
+        [void]$sb.AppendLine("Filename`t`t`t`tType`t`tSize`t`tUsed`t`tPriority")
+        foreach ($pf in Get-CimInstance -ClassName Win32_PageFileUsage) {
+            $size = [long]$pf.AllocatedBaseSize * 1024   # MB -> kB
+            $used = [long]$pf.CurrentUsage * 1024
+            [void]$sb.AppendLine("$($pf.Name)`t`t`t`tfile`t`t$size`t`t$used`t`t-2")
         }
-        
         return $sb.ToString()
     }
 }
@@ -445,17 +557,22 @@ class ProcSwaps : SHiPSLeaf {
 #region Partitions
 class ProcPartitions : SHiPSLeaf {
     ProcPartitions([string]$name) : base($name) {}
-    
+
+    # Linux layout: one row per disk, then one per partition, sizes in 1 KiB blocks.
+    # Names follow the sd convention numerically: disk0, disk0p1, ... (major 8,
+    # minor = 16 * disk + partition).
     [string] GetContent() {
         $sb = [System.Text.StringBuilder]::new()
-        [void]$sb.AppendLine("major minor  #blocks  name")
-        
-        $disks = Get-CimInstance -ClassName Win32_DiskPartition
-        foreach ($disk in $disks) {
-            $blocks = [math]::Round($disk.Size / 1024)
-            [void]$sb.AppendLine("8     0    $blocks    $($disk.DeviceID)")
+        [void]$sb.AppendLine('major minor  #blocks  name')
+        [void]$sb.AppendLine()
+        $parts = Get-CimInstance -ClassName Win32_DiskPartition
+        foreach ($disk in Get-CimInstance -ClassName Win32_DiskDrive | Sort-Object Index) {
+            [void]$sb.AppendLine(('{0,4} {1,7} {2,10} {3}' -f 8, (16 * $disk.Index), [long]($disk.Size / 1KB), "disk$($disk.Index)"))
+            foreach ($part in $parts | Where-Object DiskIndex -eq $disk.Index | Sort-Object Index) {
+                $n = $part.Index + 1
+                [void]$sb.AppendLine(('{0,4} {1,7} {2,10} {3}' -f 8, (16 * $disk.Index + $n), [long]($part.Size / 1KB), "disk$($disk.Index)p$n"))
+            }
         }
-        
         return $sb.ToString()
     }
 }

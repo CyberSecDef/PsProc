@@ -1,370 +1,280 @@
 # PowerShell proc: Drive
 
-A PowerShell 7+ module that implements a Linux `/proc` pseudo-filesystem using SHiPS (Script Hierarchy in PowerShell). This provides a familiar, filesystem-like interface for accessing Windows system information.
+A PowerShell 7 module for Windows that exposes system information as a Linux-style
+`/proc` pseudo-filesystem, built on [SHiPS](https://github.com/PowerShell/SHiPS).
+Files follow the Linux layouts in [proc(5)](https://man7.org/linux/man-pages/man5/proc.5.html)
+wherever Windows has an equivalent, so habits and parsers carry over.
 
-## Features
-
-This implementation mirrors many `/proc` components found in Linux:
-
-### Root Level Files
-- **cpuinfo** - CPU information (cores, MHz, cache, etc.)
-- **meminfo** - Memory statistics (total, free, available, swap)
-- **version** - OS version and build information
-- **uptime** - System uptime in seconds
-- **loadavg** - Load average and process counts
-- **stat** - CPU time statistics and system stats
-- **mounts** - Mounted drives/filesystems
-- **cmdline** - Current process command line
-- **filesystems** - Supported filesystem types
-- **swaps** - Pagefile/swap usage
-- **partitions** - Disk partition information
-- **modules** - Loaded Windows drivers (kernel modules)
-
-### Directories
-
-#### `/proc/net/`
-- **dev** - Network interface statistics
-- **route** - IP routing table
-- **arp** - ARP cache
-- **tcp** - Active TCP connections
-- **udp** - Active UDP endpoints
-
-#### `/proc/sys/kernel/`
-- **hostname** - System hostname
-- **ostype** - Operating system type
-- **osrelease** - OS release version
-- **version** - Full kernel version string
-
-#### `/proc/devices/`
-- **block** - Block device major numbers
-- **character** - Character device major numbers
-
-#### `/proc/self/`
-- **cmdline** - Current process command line
-- **status** - Current process status
-- **stat** - Current process statistics
-- **environ** - Environment variables
-
-#### `/proc/[PID]/`
-Each running process has a directory with:
-- **cmdline** - Process command line
-- **status** - Process status information
-- **stat** - Process statistics
-- **environ** - Process environment (limited)
-- **maps** - Memory mappings
+```powershell
+cd proc:
+cat meminfo
+cat net\tcp
+cat $PID\stat
+```
 
 ## Requirements
 
-- **PowerShell 7.0+** (PowerShell Core)
-- **SHiPS Module** (installed automatically)
-- **Windows** (tested on Windows 10/11)
+- Windows 10/11 or Windows Server 2016+
+- PowerShell 7.0+
+- The SHiPS module (the installer fetches it). Note that SHiPS itself has not had a
+  release since 0.8.1 in 2019; it works on PowerShell 7.6, but upstream fixes are unlikely.
 
 ## Installation
 
-### Quick Install
-
 ```powershell
-# Run the installation script
-.\Install-ProcDrive.ps1 -Install
+.\Install-ProcDrive.ps1 -Install                 # this session only
+.\Install-ProcDrive.ps1 -Install -AddToProfile   # mount proc: in every new session
 ```
 
-### Manual Installation
+`-Install` copies the module to your CurrentUser module path
+(`Documents\PowerShell\Modules\ProcFileSystem\<version>`), imports it, and mounts `proc:`
+globally. It is safe to re-run.
+
+To remove it:
 
 ```powershell
-# Install SHiPS module
-Install-Module -Name SHiPS -Scope CurrentUser
-
-# Import the module
-Import-Module .\ProcFileSystem.psm1
-
-# Create the proc: drive
-New-PSDrive -Name proc -PSProvider SHiPS -Root 'ProcFileSystem#ProcRoot'
+.\Install-ProcDrive.ps1 -Uninstall               # unmount and unload
+.\Install-ProcDrive.ps1 -Uninstall -RemoveFiles  # also delete the module and the profile entry
 ```
 
-## Usage
-
-### Basic Navigation
+Manual setup, if you prefer:
 
 ```powershell
-# Navigate to proc drive
-cd proc:
-
-# List all entries
-ls
-
-# Read CPU information
-cat cpuinfo
-
-# Read memory information
-cat meminfo
-
-# Navigate to network information
-cd net
-cat dev
+Install-Module SHiPS -Scope CurrentUser
+Import-Module .\ProcFileSystem.psd1
+Mount-ProcDrive                         # global and idempotent; Dismount-ProcDrive removes it
 ```
 
-### Example Queries
+Use `Mount-ProcDrive` rather than `New-PSDrive` from scripts and functions:
+`New-PSDrive` defaults to the caller's local scope, so a drive created inside a script
+disappears when the script returns.
 
-#### System Information
+## Reading files
+
+**Each file is returned as one string.** `Get-Content -Raw` is not supported by the
+SHiPS provider (and isn't needed). To work line by line, split it:
+
 ```powershell
-# Get total memory
-(cat proc:\meminfo | Select-String 'MemTotal').ToString().Split()[1]
-
-# Count CPU cores
-((cat proc:\cpuinfo -Raw) -split 'processor\s+:').Count - 1
-
-# Get system uptime in hours
-[math]::Round((cat proc:\uptime).Split()[0] / 3600, 2)
+$lines = (Get-Content proc:\meminfo) -split "`r?`n"
+$lines | Select-String MemAvailable
 ```
 
-#### Network Information
+Files that Linux NUL-separates (`cmdline`, `environ`) are NUL-separated here too:
+
 ```powershell
-# View network interfaces
-cat proc:\net\dev
-
-# View routing table
-cat proc:\net\route
-
-# View TCP connections
-cat proc:\net\tcp
-
-# Count active TCP connections
-((cat proc:\net\tcp) -split "`n" | Select -Skip 1).Count
+(Get-Content proc:\self\cmdline).TrimEnd("`0") -split "`0"
 ```
 
-#### Process Information
+## Layout
+
+| Path | Contents | Windows source |
+|---|---|---|
+| `cpuinfo` | One block per logical CPU: family/model/stepping, MHz, cache, real feature flags | `Win32_Processor`, `IsProcessorFeaturePresent` |
+| `meminfo` | Memory and swap in kB (mapping below) | Memory performance counters, page files |
+| `stat` | Cumulative per-CPU ticks since boot, `intr`, `ctxt`, `btime` | Raw processor and system counters |
+| `loadavg` | 1/5/15-minute load, runnable/total threads, newest PID | Built-in sampler (below) |
+| `uptime` | Seconds since boot, idle seconds summed over CPUs | `GetTickCount64`, `GetSystemTimes` |
+| `version` | OS caption, build, architecture | `Win32_OperatingSystem` |
+| `cmdline` | Boot loader options (the kernel command line) | `SystemStartOptions` |
+| `mounts` | Volume GUID path or UNC share, mount point, fs type, ro/rw | `Win32_Volume`, `Win32_LogicalDisk` |
+| `filesystems` | Filesystem drivers currently loaded, Linux names | `Win32_SystemDriver` |
+| `swaps` | Page files, sizes in kB | `Win32_PageFileUsage` |
+| `partitions` | Disks and partitions in 1 KiB blocks, named `disk0`, `disk0p1`, ... | `Win32_DiskDrive`, `Win32_DiskPartition` |
+| `modules` | Running kernel drivers | `Win32_SystemDriver` |
+| `net\dev` | Per-interface rx/tx bytes, packets, errors, drops | `Get-NetAdapterStatistics` |
+| `net\tcp`, `net\tcp6` | Sockets in Linux hex format with Linux state codes | `Get-NetTCPConnection` |
+| `net\udp`, `net\udp6` | UDP endpoints in Linux hex format | `Get-NetUDPEndpoint` |
+| `net\route` | IPv4 routes: hex dest/gateway/mask, RTF flags, effective metric | `Get-NetRoute` (active store) |
+| `net\arp` | Neighbor cache with ATF flags | `Get-NetNeighbor` |
+| `sys\kernel\{hostname,ostype,osrelease,version}` | Host and OS identity | environment, `Win32_OperatingSystem` |
+| `devices\{block,character}` | Static Linux-style major number tables | none (illustrative) |
+| `<PID>\`, `self\` | `cmdline`, `status`, `stat`, `environ`, `maps` | `Get-Process`, `NtQueryInformationProcess` |
+
+### Process files
+
+- **`stat`** has all 52 proc(5) fields in order. As on Linux, comm (field 2) can contain
+  spaces, so parse by splitting after the last `)` rather than on every space. Real values: pid, comm (15 chars, like
+  Linux), state, ppid, session (the Windows session id), utime/stime in ticks, priority
+  and nice (mapped from the priority class), num_threads, starttime in ticks since boot,
+  vsize, rss in 4 KiB pages. Fields with no Windows equivalent are 0.
+- **`status`** gives Name, State, Tgid, Pid, PPid, VmPeak, VmSize, VmHWM, VmRSS, VmData
+  and Threads.
+- **State** is derived from thread states: `R` if any thread is running or ready, `T` if
+  every thread is suspended, otherwise `S`.
+- **`cmdline`** is split with `CommandLineToArgvW`, so a quoted argument containing
+  spaces stays one argument. It is empty for processes whose command line can't be read
+  (Idle, System, protected processes), as for Linux kernel threads.
+- **`environ`** is only readable for `self`; other processes raise an access error.
+- **`maps`** lists loaded module images only. Windows doesn't expose heaps and stacks
+  the same way.
+
+### Memory mapping
+
+| Linux field | Windows value |
+|---|---|
+| `MemFree` | Free and zeroed page lists |
+| `MemAvailable` | Available Bytes (free + standby) |
+| `Cached` | Standby lists (Windows' page cache) |
+| `Dirty` | Modified page list |
+| `Slab` / `SReclaimable` / `SUnreclaim` | Paged + non-paged pool / paged pool / non-paged pool |
+| `SwapTotal` / `SwapFree` | Page files only |
+| `CommitLimit` / `Committed_AS` | Commit limit / committed bytes |
+| `Buffers`, `Shmem`, `SwapCached` | 0 (no equivalent) |
+
+### Load average
+
+Windows keeps no run-queue average. From the moment the module loads, a background timer
+samples CPU demand (busy fraction × CPU count) every 5 seconds and applies Linux's
+exponential decay for the 1-, 5- and 15-minute averages, seeded with the average since
+boot. It measures CPU demand only; threads waiting on disk, which Linux would count,
+are not included.
+
+### Differences from Linux worth knowing
+
+- `stat`'s `processes` line is the current process count; Windows has no forks-since-boot counter.
+- `loadavg`'s last field is the most recently started PID. Windows PIDs aren't sequential.
+- In `net\tcp*` and `net\udp*`, `uid` and `inode` are 0. To map a socket to a process,
+  use `Get-NetTCPConnection`, which has `OwningProcess`.
+- `mounts` escapes whitespace but leaves backslashes as they are, so Windows paths stay readable.
+- Interface names in `net\*` are the Windows aliases and can contain spaces
+  (`Wi-Fi`, `Ethernet 2`). `net\route` is tab-separated, so split on tabs.
+
+## Caching
+
+Process directories and the root listing are live: new processes appear and exited ones
+disappear without refreshing. Other directory listings (`net`, `sys`, `devices`) are
+cached by SHiPS; `ls -Force` refreshes them. File contents are generated fresh on every read.
+
+## Examples
+
 ```powershell
-# List all process IDs
-ls proc:\ | Where Name -match '^\d+$' | Select -ExpandProperty Name
+# Memory as an object (values in kB)
+$mem = @{}
+foreach ($l in (Get-Content proc:\meminfo) -split "`r?`n") {
+    if ($l -match '^(\w+):\s+(\d+) kB') { $mem[$Matches[1]] = [long]$Matches[2] }
+}
+'{0:N1} GB available of {1:N1} GB' -f ($mem.MemAvailable / 1MB), ($mem.MemTotal / 1MB)
 
-# Get current process info
-cat proc:\self\status
+# CPU usage over one second from /proc/stat, the way top computes it
+$read = { ((Get-Content proc:\stat) -split "`r?`n")[0] -split '\s+' | Select-Object -Skip 1 | ForEach-Object { [long]$_ } }
+$a = & $read; Start-Sleep 1; $b = & $read
+$total = ($b | Measure-Object -Sum).Sum - ($a | Measure-Object -Sum).Sum
+'{0:P0} busy' -f (1 - ($b[3] - $a[3]) / $total)
 
-# Get specific process command line (replace 1234 with PID)
-cat proc:\1234\cmdline
+# Boot time
+$btime = ((Get-Content proc:\stat) -split "`r?`n" | Where-Object { $_ -like 'btime *' }).Split(' ')[1]
+[DateTimeOffset]::FromUnixTimeSeconds($btime).LocalDateTime
 
-# Find all PowerShell processes
-ls proc:\ | Where Name -match '^\d+$' | ForEach-Object {
-    $status = cat "$($_.FullName)\status" -Raw
-    if ($status -match 'pwsh|powershell') {
-        [PSCustomObject]@{
-            PID = $_.Name
-            Info = $status
-        }
+# Listening TCP ports (state 0A), decoded from hex
+(Get-Content proc:\net\tcp) -split "`r?`n" | Select-Object -Skip 1 | Where-Object { $_ } |
+    ForEach-Object { $f = $_.Trim() -split '\s+'; if ($f[3] -eq '0A') { [Convert]::ToInt32($f[1].Split(':')[1], 16) } } |
+    Sort-Object -Unique
+
+# Top five processes by resident memory. comm (field 2) can contain spaces, e.g.
+# "(Creative Cloud)", so split after the last ')' as Linux tools do: field N is $rest[N-3].
+Get-ChildItem proc:\ | Where-Object Name -match '^\d+$' | ForEach-Object {
+    $s = Get-Content "proc:\$($_.Name)\stat" -ErrorAction SilentlyContinue   # processes can exit mid-loop
+    if ($s) {
+        $close = $s.LastIndexOf(')')
+        $rest = $s.Substring($close + 2) -split ' '
+        [pscustomobject]@{ Pid = $_.Name; Name = $s.Substring($s.IndexOf('(') + 1, $close - $s.IndexOf('(') - 1); RssMB = [long]$rest[21] * 4KB / 1MB }
     }
-}
+} | Sort-Object RssMB -Descending | Select-Object -First 5
+
+# A process's argv
+$p = Get-Process -Id $PID
+(Get-Content "proc:\$($p.Id)\cmdline").TrimEnd("`0") -split "`0"
 ```
 
-#### System Statistics
-```powershell
-# View system statistics
-cat proc:\stat
-
-# Get boot time
-(cat proc:\stat | Select-String 'btime').ToString().Split()[1]
-
-# View loaded drivers/modules
-cat proc:\modules | Select -First 10
-```
-
-## Integration with PowerShell
-
-The proc: drive integrates seamlessly with PowerShell cmdlets:
+## Testing
 
 ```powershell
-# Search for specific information
-Get-Content proc:\cpuinfo | Select-String 'model name'
-
-# Use PowerShell filtering
-Get-ChildItem proc:\net | Where-Object Name -eq 'tcp'
-
-# Combine with other cmdlets
-(cat proc:\meminfo | Select-String 'MemFree').ToString() | 
-    ForEach-Object { $_.Split()[1] } | 
-    ForEach-Object { [int]$_ / 1MB }
-
-# Monitor changes (requires external Watch function)
-while ($true) {
-    Clear-Host
-    cat proc:\uptime
-    cat proc:\loadavg
-    Start-Sleep -Seconds 1
-}
+Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser
+.\Test-ProcDrive.ps1 -RunTests                    # exit code = number of failed tests
+.\Test-ProcDrive.ps1 -RunTests -IncludeInstaller  # also round-trips the installer
+.\Test-ProcDrive.ps1 -Demo                        # one-screen system summary
+.\Test-ProcDrive.ps1 -Benchmark                   # read timings
 ```
 
-## Comparison with Linux /proc
+The tests check values against Windows' own APIs, not just that files are non-empty: for
+example that every `net\tcp` row decodes to a live connection and that `stat` counters
+grow between reads. The installer tests write to your real module path and profile, so
+they are opt-in. They restore both afterwards and skip themselves if the module is already
+installed.
 
-| Linux Path | Windows proc: | Notes |
-|------------|---------------|-------|
-| /proc/cpuinfo | proc:\cpuinfo | Full CPU details |
-| /proc/meminfo | proc:\meminfo | Memory statistics |
-| /proc/version | proc:\version | OS version |
-| /proc/uptime | proc:\uptime | System uptime |
-| /proc/loadavg | proc:\loadavg | Simulated load average |
-| /proc/net/dev | proc:\net\dev | Network interfaces |
-| /proc/net/tcp | proc:\net\tcp | TCP connections |
-| /proc/[pid]/cmdline | proc:\[pid]\cmdline | Process command line |
-| /proc/[pid]/status | proc:\[pid]\status | Process status |
-| /proc/sys/kernel/hostname | proc:\sys\kernel\hostname | System hostname |
+## Performance
 
-## Limitations
-
-Some differences from Linux `/proc`:
-
-1. **Load Average** - Windows doesn't have a native load average, so this is simulated using CPU usage
-2. **Process Environment** - Windows security prevents reading other processes' environment variables
-3. **Memory Details** - Some Linux-specific memory categories (buffers, cached) are not directly applicable
-4. **Real-time Updates** - Some values are cached by SHiPS for performance
-5. **Write Operations** - This implementation is read-only (Linux /proc has some writable files in /proc/sys)
-
-## Performance Notes
-
-- The SHiPS provider caches results by default for better performance
-- Process directories are not cached to show current processes
-- Use `ls -Force` to refresh cached content
-- Large directories (many processes) may take time to enumerate
-
-## Uninstallation
-
-```powershell
-# Remove the proc: drive
-.\Install-ProcDrive.ps1 -Uninstall
-
-# Or manually
-Remove-PSDrive -Name proc
-Remove-Module ProcFileSystem
-```
-
-## Advanced Usage
-
-### Creating Custom Views
-
-```powershell
-# Create a function to display memory usage
-function Get-ProcMemory {
-    $meminfo = cat proc:\meminfo | ConvertFrom-StringData -Delimiter ':'
-    [PSCustomObject]@{
-        TotalGB = [math]::Round([int]$meminfo.MemTotal.Trim().Split()[0] / 1MB, 2)
-        FreeGB = [math]::Round([int]$meminfo.MemFree.Trim().Split()[0] / 1MB, 2)
-        UsedPercent = [math]::Round((1 - ([int]$meminfo.MemFree.Trim().Split()[0] / [int]$meminfo.MemTotal.Trim().Split()[0])) * 100, 2)
-    }
-}
-
-Get-ProcMemory
-```
-
-### Monitoring Scripts
-
-```powershell
-# Monitor network traffic
-$previous = cat proc:\net\dev -Raw
-while ($true) {
-    Start-Sleep -Seconds 5
-    $current = cat proc:\net\dev -Raw
-    Clear-Host
-    Write-Host "Network Traffic:" -ForegroundColor Cyan
-    $current
-    $previous = $current
-}
-```
-
-## Troubleshooting
-
-### Module Not Loading
-```powershell
-# Ensure PowerShell 7+
-$PSVersionTable.PSVersion
-
-# Check SHiPS installation
-Get-Module -ListAvailable SHiPS
-```
-
-### Drive Not Appearing
-```powershell
-# Check if drive exists
-Get-PSDrive proc
-
-# Recreate drive
-New-PSDrive -Name proc -PSProvider SHiPS -Root 'ProcFileSystem#ProcRoot'
-```
-
-### Permission Errors
-Some operations require elevated privileges. Run PowerShell as Administrator if needed.
+Most files take 50–400 ms because they query WMI or performance counters. `cpuinfo` takes
+about a second, almost all of it in `Win32_Processor` itself. Listing the root directory,
+PIDs included, takes about 25 ms.
 
 ## Visualization
 
-### Subway Map
-
 ![PsProc Subway Map](codebase-subway-map.png)
 
-*The PsProc filesystem structure visualized as a subway map. Each colored line represents a different category of system information.*
-
-The PsProc filesystem structure can be visualized as a subway/metro map, showing the hierarchical relationships between different components.
-
-#### Generating the Subway Map
+*The proc: layout drawn as a subway map: each colored line is one category of files,
+with `proc:\` as the central hub.*
 
 ```powershell
-# Using the PowerShell wrapper (recommended)
-.\New-SubwayMap.ps1
-
-# Open the map after generation
-.\New-SubwayMap.ps1 -Open
-
-# Custom output path
-.\New-SubwayMap.ps1 -OutputPath "my-custom-map.png"
+.\New-SubwayMap.ps1                                # regenerate codebase-subway-map.png
+.\New-SubwayMap.ps1 -Open                          # and open it
+.\New-SubwayMap.ps1 -OutputPath my-map.png
 ```
 
-Or using Python directly:
+Or with Python directly:
+
 ```bash
-# Default output
-python3 Generate-SubwayMap.py
-
-# Custom output file
-python3 Generate-SubwayMap.py --output my-map.png
-
-# Custom DPI
 python3 Generate-SubwayMap.py --output my-map.png --dpi 150
 ```
 
-#### Map Legend
+Lines: **System Info** (red) for cpuinfo, meminfo, version, uptime, loadavg and stat;
+**Network** (teal) for `net\`; **Configuration** (orange) for `sys\kernel\`; **Devices**
+(coral) for `devices\`; **Process** (dark blue) for `self\` and `<PID>\`; **Storage**
+(purple) for mounts, swaps, partitions and filesystems.
 
-The subway map uses colored lines to represent different categories:
+Requires Python 3 with matplotlib and numpy (`pip install matplotlib numpy`);
+`New-SubwayMap.ps1` installs missing packages itself.
 
-- **System Info Line (Red)** - System information files (cpuinfo, meminfo, version, uptime, loadavg, stat)
-- **Network Line (Teal)** - Network-related files in `/proc/net/` (dev, route, arp, tcp, udp)
-- **Configuration Line (Orange)** - System configuration in `/proc/sys/` (hostname, ostype, osrelease, version)
-- **Devices Line (Coral)** - Device information in `/proc/devices/` (block, character)
-- **Process Line (Dark Blue)** - Process-related directories (`/proc/self/`, `/proc/[PID]/`)
-- **Storage Line (Purple)** - Storage and filesystem information (mounts, swaps, partitions, filesystems)
+## Status and remaining work
 
-The central hub `proc:/` connects all lines, representing the root of the filesystem hierarchy.
+Tested on Windows 11 Pro (build 26300), PowerShell 7.6.10, SHiPS 0.8.1 and Pester 6.2.0:
+66 tests pass, elevated and under a restricted (Basic User) token. Still to do:
 
-#### Requirements for Visualization
+**Testing gaps**
+- Not yet run as an ordinary standard (non-admin, UAC-filtered) user. The test machine's
+  admin account isn't UAC-filtered, so non-elevated runs used the stricter Basic User
+  token, under which WMI is denied entirely and the WMI-backed system files fail.
+- Not tested on Windows 10, Windows Server, ARM64, or machines with more than 64 logical
+  CPUs (processor groups). The `/proc/stat` code handles `group,N` counter instances, but
+  that path hasn't run on real hardware.
+- No CI. The suite needs a Windows runner; a GitHub Actions `windows-latest` job running
+  `.\Test-ProcDrive.ps1 -RunTests` would cover it.
 
-- Python 3.x
-- matplotlib (`pip install matplotlib`)
-- numpy (`pip install numpy`)
-
-The PowerShell wrapper script will automatically check for and install missing dependencies.
-
-## Contributing
-
-This is a read-only implementation. Contributions welcome for:
-- Additional /proc components
-- Performance optimizations
-- Better Windows-specific adaptations
-- Bug fixes
+**Known limitations**
+- `cpuinfo` takes about a second because `Win32_Processor` does. The static fields (model,
+  family, flags, cache) could be cached at import, leaving only MHz to query live.
+- Importing the module by file path (`Import-Module .\ProcFileSystem.psd1`) prints a
+  harmless "module not loaded" error: SHiPS re-imports the module by name in its own
+  runspace and then falls back to the path. Installing with `-Install` avoids it.
+- `modules` reports every driver's size as 0, since `Win32_SystemDriver` has no size.
+  `EnumDeviceDrivers` plus the image headers could provide real sizes.
+- `devices\block` and `devices\character` are static illustrative tables, not real data.
+- `net\tcp*` and `net\udp*` report `uid` and `inode` as 0, so a socket can't be mapped to
+  a process through `proc:`. A non-Linux extra column (or file) exposing `OwningProcess`
+  would help.
+- `loadavg` measures CPU demand only. Linux also counts threads blocked on I/O; an
+  equivalent would need run-queue sampling through PDH.
+- `maps` lists module images only, not heaps, stacks or other mappings
+  (`VirtualQueryEx` could fill this in for processes the caller can open).
+- `environ` only works for `self`. Reading another process's environment would mean
+  reading its PEB with `ReadProcessMemory`.
+- `stat` fields 10–13 (page faults) and per-process I/O are 0. Win32_Process `PageFaults`
+  and `GetProcessIoCounters` could supply real values, and an `io` file could be added.
+- The subway map predates `net\tcp6`, `net\udp6` and `self\maps`. The station lists in
+  `Generate-SubwayMap.py` need those added and the PNG regenerating.
+- SHiPS is unmaintained upstream. If a future PowerShell release breaks it, the provider
+  would need porting to a compiled `NavigationCmdletProvider`.
 
 ## License
 
-MIT License - feel free to use and modify
-
-## References
-
-- [Linux /proc documentation](https://www.kernel.org/doc/Documentation/filesystems/proc.txt)
-- [SHiPS Module](https://github.com/PowerShell/SHiPS)
-- [PowerShell Documentation](https://docs.microsoft.com/powershell/)
-
-## Author
-
-Created as a demonstration of PowerShell's extensibility and cross-platform concepts.
+MIT. See [LICENSE](LICENSE).

@@ -1,169 +1,156 @@
+#Requires -Version 7.0
 <#
 .SYNOPSIS
-    Installation and usage script for the PowerShell proc: filesystem provider
+    Installs, mounts or removes the PowerShell proc: drive.
 .DESCRIPTION
-    Installs SHiPS module if needed and sets up the proc: drive
-.NOTES
-    Requires PowerShell 7+
+    -Install copies the module into your CurrentUser module path (so it can be imported
+    by name, which SHiPS relies on), imports it, and mounts proc: in the global scope so
+    the drive survives after this script returns. -AddToProfile also mounts it in every
+    new session.
+.EXAMPLE
+    .\Install-ProcDrive.ps1 -Install -AddToProfile
+.EXAMPLE
+    .\Install-ProcDrive.ps1 -Uninstall -RemoveFiles
 #>
-
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Help')]
 param(
-    [switch]$Install,
-    [switch]$Uninstall,
-    [switch]$ShowExamples
+    [Parameter(Mandatory, ParameterSetName = 'Install')]   [switch]$Install,
+    [Parameter(ParameterSetName = 'Install')]              [switch]$AddToProfile,
+    [Parameter(Mandatory, ParameterSetName = 'Uninstall')] [switch]$Uninstall,
+    [Parameter(ParameterSetName = 'Uninstall')]            [switch]$RemoveFiles,
+    [Parameter(Mandatory, ParameterSetName = 'Examples')]  [switch]$ShowExamples
 )
 
+$ErrorActionPreference = 'Stop'
+$ModuleName   = 'ProcFileSystem'
+$ModuleRoot   = Join-Path ([Environment]::GetFolderPath('MyDocuments')) 'PowerShell\Modules'
+$ProfilePath  = $PROFILE.CurrentUserAllHosts
+$ProfileStart = '# >>> ProcFileSystem >>>'
+$ProfileEnd   = '# <<< ProcFileSystem <<<'
+
 function Install-ProcDrive {
-    Write-Host "Installing PowerShell proc: drive..." -ForegroundColor Cyan
-    
-    # Check PowerShell version
-    if ($PSVersionTable.PSVersion.Major -lt 7) {
-        Write-Error "This script requires PowerShell 7 or later. Current version: $($PSVersionTable.PSVersion)"
-        return
-    }
-    
-    # Install SHiPS module if not present
+    if (-not $IsWindows) { throw 'The proc: drive only works on Windows.' }
+    Write-Host 'Installing PowerShell proc: drive...' -ForegroundColor Cyan
+
     if (-not (Get-Module -ListAvailable -Name SHiPS)) {
-        Write-Host "Installing SHiPS module..." -ForegroundColor Yellow
-        Install-Module -Name SHiPS -Scope CurrentUser -Force -AllowClobber
+        Write-Host 'Installing SHiPS module...' -ForegroundColor Yellow
+        Install-Module -Name SHiPS -Scope CurrentUser -Force
     }
-    else {
-        Write-Host "SHiPS module already installed" -ForegroundColor Green
+
+    $manifest = Join-Path $PSScriptRoot "$ModuleName.psd1"
+    if (-not (Test-Path $manifest)) { throw "$ModuleName.psd1 not found next to this script ($PSScriptRoot)" }
+    $version = (Import-PowerShellDataFile $manifest).ModuleVersion
+    $target  = Join-Path $ModuleRoot "$ModuleName\$version"
+
+    Write-Host "Copying module to $target" -ForegroundColor Yellow
+    New-Item -ItemType Directory -Force -Path $target | Out-Null
+    Copy-Item -Force (Join-Path $PSScriptRoot "$ModuleName.psd1"), (Join-Path $PSScriptRoot "$ModuleName.psm1") $target
+
+    # Drop any copy already loaded from elsewhere (e.g. imported by path) before re-importing.
+    Get-PSDrive -Name proc -Scope Global -ErrorAction SilentlyContinue | Remove-PSDrive -Force
+    Get-Module $ModuleName | Remove-Module -Force
+    Import-Module $ModuleName -RequiredVersion $version -Global -Force
+    Mount-ProcDrive
+
+    if ($AddToProfile) { Add-ProfileBlock }
+
+    Write-Host "`nproc: drive is mounted." -ForegroundColor Green
+    Write-Host '  cd proc:; ls; cat cpuinfo' -ForegroundColor White
+    if (-not $AddToProfile) {
+        Write-Host "`nIt lasts for this session only. Re-run with -AddToProfile to mount it in every session." -ForegroundColor Gray
     }
-    
-    # Import the module
-    $modulePath = Join-Path $PSScriptRoot "ProcFileSystem.psm1"
-    if (-not (Test-Path $modulePath)) {
-        Write-Error "ProcFileSystem.psm1 not found at: $modulePath"
+}
+
+function Add-ProfileBlock {
+    $block = @"
+$ProfileStart
+if (`$IsWindows -and (Get-Module -ListAvailable -Name $ModuleName)) {
+    Import-Module $ModuleName
+    Mount-ProcDrive
+}
+$ProfileEnd
+"@
+    $existing = if (Test-Path $ProfilePath) { Get-Content $ProfilePath -Raw } else { '' }
+    if ($existing -and $existing.Contains($ProfileStart)) {
+        Write-Host "Profile already mounts proc: ($ProfilePath)" -ForegroundColor Green
         return
     }
-    
-    Write-Host "Importing ProcFileSystem module..." -ForegroundColor Yellow
-    Import-Module $modulePath -Force
-    
-    # Create the proc: drive
-    Write-Host "Creating proc: drive..." -ForegroundColor Yellow
-    if (-not (Test-Path proc:)) {
-        New-PSDrive -Name proc -PSProvider SHiPS -Root 'ProcFileSystem#ProcRoot' -Scope Global
-        Write-Host "proc: drive created with global scope" -ForegroundColor Green
-    }
-    else {
-        Write-Host "proc: drive already exists" -ForegroundColor Yellow
-    }
-    
-    if (Test-Path proc:) {
-        Write-Host "`nproc: drive successfully created!" -ForegroundColor Green
-        Write-Host "`nYou can now navigate to proc: and explore system information:" -ForegroundColor Cyan
-        Write-Host "  cd proc:" -ForegroundColor White
-        Write-Host "  dir" -ForegroundColor White
-        Write-Host "  cat cpuinfo" -ForegroundColor White
-        Write-Host "  cat meminfo" -ForegroundColor White
-        Write-Host "`nRun with -ShowExamples to see more usage examples" -ForegroundColor Gray
-    }
-    else {
-        Write-Error "Failed to create proc: drive"
+    New-Item -ItemType Directory -Force -Path (Split-Path $ProfilePath) | Out-Null
+    Add-Content -Path $ProfilePath -Value "`n$block"
+    Write-Host "Added proc: mount to $ProfilePath" -ForegroundColor Green
+}
+
+function Remove-ProfileBlock {
+    if (-not (Test-Path $ProfilePath)) { return }
+    $text = Get-Content $ProfilePath -Raw
+    $pattern = '(?s)\r?\n?' + [regex]::Escape($ProfileStart) + '.*?' + [regex]::Escape($ProfileEnd) + '\r?\n?'
+    if ($text -match $pattern) {
+        $rest = ($text -replace $pattern, "`n").Trim()
+        if ($rest) { Set-Content -Path $ProfilePath -Value $rest } else { Remove-Item $ProfilePath }
+        Write-Host "Removed proc: mount from $ProfilePath" -ForegroundColor Green
     }
 }
 
 function Uninstall-ProcDrive {
-    Write-Host "Removing proc: drive..." -ForegroundColor Yellow
-    
-    if (Test-Path proc:) {
-        Remove-PSDrive -Name proc -Force
-        Write-Host "proc: drive removed successfully" -ForegroundColor Green
+    if (Get-PSDrive -Name proc -Scope Global -ErrorAction SilentlyContinue) {
+        Remove-PSDrive -Name proc -Scope Global -Force
+        Write-Host 'proc: drive removed' -ForegroundColor Green
+    } else {
+        Write-Host 'proc: drive not mounted' -ForegroundColor Yellow
     }
-    else {
-        Write-Host "proc: drive not found" -ForegroundColor Yellow
+    if (Get-Module $ModuleName) {
+        Remove-Module $ModuleName -Force
+        Write-Host "$ModuleName module unloaded" -ForegroundColor Green
     }
-    
-    # Remove the module
-    if (Get-Module ProcFileSystem) {
-        Remove-Module ProcFileSystem -Force
-        Write-Host "ProcFileSystem module unloaded" -ForegroundColor Green
+    if ($RemoveFiles) {
+        $dir = Join-Path $ModuleRoot $ModuleName
+        if (Test-Path $dir) {
+            Remove-Item -Recurse -Force $dir
+            Write-Host "Deleted $dir" -ForegroundColor Green
+        }
+        Remove-ProfileBlock
     }
 }
 
 function Show-Examples {
-    Write-Host "`n=== PowerShell proc: Drive Usage Examples ===" -ForegroundColor Cyan
-    Write-Host "`nBasic Navigation:" -ForegroundColor Yellow
-    Write-Host "  cd proc:                    # Navigate to proc drive"
-    Write-Host "  ls                          # List all proc entries"
-    Write-Host "  cd net                      # Navigate to network info"
-    Write-Host "  cd sys\kernel               # Navigate to kernel info"
-    
-    Write-Host "`nReading System Information:" -ForegroundColor Yellow
-    Write-Host "  cat cpuinfo                 # CPU information"
-    Write-Host "  cat meminfo                 # Memory information"
-    Write-Host "  cat version                 # OS version"
-    Write-Host "  cat uptime                  # System uptime"
-    Write-Host "  cat loadavg                 # Load average"
-    Write-Host "  cat stat                    # System statistics"
-    
-    Write-Host "`nNetwork Information:" -ForegroundColor Yellow
-    Write-Host "  cat net\dev                 # Network device statistics"
-    Write-Host "  cat net\route               # Routing table"
-    Write-Host "  cat net\arp                 # ARP table"
-    Write-Host "  cat net\tcp                 # TCP connections"
-    Write-Host "  cat net\udp                 # UDP endpoints"
-    
-    Write-Host "`nProcess Information:" -ForegroundColor Yellow
-    Write-Host "  ls | Where Name -match '^\d+$'  # List all process directories"
-    Write-Host "  cat self\cmdline            # Current process command line"
-    Write-Host "  cat self\status             # Current process status"
-    Write-Host "  cat <PID>\cmdline           # Specific process command line"
-    Write-Host "  cat <PID>\stat              # Specific process statistics"
-    
-    Write-Host "`nSystem Configuration:" -ForegroundColor Yellow
-    Write-Host "  cat sys\kernel\hostname     # System hostname"
-    Write-Host "  cat sys\kernel\ostype       # OS type"
-    Write-Host "  cat sys\kernel\osrelease    # OS release version"
-    Write-Host "  cat sys\kernel\version      # Kernel version"
-    
-    Write-Host "`nOther Information:" -ForegroundColor Yellow
-    Write-Host "  cat mounts                  # Mounted filesystems"
-    Write-Host "  cat swaps                   # Swap/pagefile usage"
-    Write-Host "  cat partitions              # Partition information"
-    Write-Host "  cat modules                 # Loaded drivers/modules"
-    Write-Host "  cat filesystems             # Supported filesystems"
-    
-    Write-Host "`nAdvanced Usage:" -ForegroundColor Yellow
-    Write-Host "  Get-Content proc:\meminfo | Select-String 'MemTotal'"
-    Write-Host "  Get-ChildItem proc:\ | Where-Object Name -match '^\d+$' | Measure-Object"
-    Write-Host "  (Get-Content proc:\cpuinfo -Raw) -split '`n`n' | Measure-Object"
-    
-    Write-Host "`nPowerShell Integration:" -ForegroundColor Yellow
-    Write-Host "  # Monitor CPU info"
-    Write-Host "  Watch { cat proc:\cpuinfo | Select -First 20 }"
-    Write-Host "  "
-    Write-Host "  # Get all TCP connections"
-    Write-Host "  (cat proc:\net\tcp) -split '`n' | Select -Skip 1"
-    Write-Host "  "
-    Write-Host "  # Find processes by name"
-    Write-Host "  ls proc:\ | Where Name -match '^\d+$' | ForEach {"
-    Write-Host "      [PSCustomObject]@{"
-    Write-Host "          PID = `$_.Name"
-    Write-Host "          Status = cat `$_.FullName\status -Raw"
-    Write-Host "      }"
-    Write-Host "  }"
-    
-    Write-Host "`n" -NoNewline
+    @'
+
+=== PowerShell proc: Drive Usage Examples ===
+
+Navigation:
+  cd proc:                     # enter the drive
+  ls                           # list entries (PID directories included)
+  cd net; ls                   # network files
+  cd sys\kernel                # kernel info
+
+Reading files (each file comes back as ONE string; split it into lines yourself):
+  cat cpuinfo
+  cat meminfo
+  (cat proc:\meminfo) -split "`r?`n" | Select-String MemAvailable
+  cat net\dev; cat net\tcp; cat net\tcp6; cat net\route; cat net\arp
+  cat sys\kernel\hostname
+
+Processes:
+  ls proc:\ | Where-Object Name -match '^\d+$'      # all PIDs
+  cat self\status                                    # this shell
+  cat <PID>\status; cat <PID>\stat; cat <PID>\maps
+  (cat proc:\<PID>\cmdline) -split "`0"              # argv, NUL-separated like Linux
+
+Notes:
+  -Raw is not supported by the SHiPS provider; it is not needed (content is one string).
+  Process directories are live; other entries are cached until 'ls -Force'.
+
+'@ | Write-Host
 }
 
-# Main execution
-if ($Install) {
-    Install-ProcDrive
-}
-elseif ($Uninstall) {
-    Uninstall-ProcDrive
-}
-elseif ($ShowExamples) {
-    Show-Examples
-}
-else {
-    Write-Host "PowerShell proc: Drive Setup" -ForegroundColor Cyan
-    Write-Host "Usage:" -ForegroundColor Yellow
-    Write-Host "  .\Install-ProcDrive.ps1 -Install        # Install and create proc: drive"
-    Write-Host "  .\Install-ProcDrive.ps1 -Uninstall      # Remove proc: drive"
-    Write-Host "  .\Install-ProcDrive.ps1 -ShowExamples   # Show usage examples"
+switch ($PSCmdlet.ParameterSetName) {
+    'Install'   { Install-ProcDrive }
+    'Uninstall' { Uninstall-ProcDrive }
+    'Examples'  { Show-Examples }
+    default {
+        Write-Host 'PowerShell proc: Drive Setup' -ForegroundColor Cyan
+        Write-Host '  .\Install-ProcDrive.ps1 -Install [-AddToProfile]   # install module, mount proc:'
+        Write-Host '  .\Install-ProcDrive.ps1 -Uninstall [-RemoveFiles]  # unmount; optionally delete module + profile entry'
+        Write-Host '  .\Install-ProcDrive.ps1 -ShowExamples              # usage examples'
+    }
 }

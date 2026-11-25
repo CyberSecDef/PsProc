@@ -1,354 +1,104 @@
+#Requires -Version 7.0
 <#
 .SYNOPSIS
-    Test and demonstration script for PowerShell proc: drive
+    Test, demo and benchmark runner for the PowerShell proc: drive.
 .DESCRIPTION
-    Validates functionality and demonstrates various features of the proc: filesystem
+    -RunTests runs the Pester suite in .\Tests and exits with the number of failed tests,
+    so it can gate CI. Add -IncludeInstaller to also run the installer round trip (it
+    touches your CurrentUser module path and profile, and restores them).
+.EXAMPLE
+    .\Test-ProcDrive.ps1 -RunTests
 #>
-
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Help')]
 param(
-    [switch]$RunTests,
-    [switch]$Demo,
-    [switch]$Benchmark
+    [Parameter(Mandatory, ParameterSetName = 'Tests')]     [switch]$RunTests,
+    [Parameter(ParameterSetName = 'Tests')]                [switch]$IncludeInstaller,
+    [Parameter(Mandatory, ParameterSetName = 'Demo')]      [switch]$Demo,
+    [Parameter(Mandatory, ParameterSetName = 'Benchmark')] [switch]$Benchmark
 )
 
-function Test-ProcDrive {
-    Write-Host "`n=== Testing proc: Drive Functionality ===" -ForegroundColor Cyan
-    
-    $testsPassed = 0
-    $testsFailed = 0
-    
-    # Test 1: Drive exists
-    Write-Host "`nTest 1: Checking if proc: drive exists..." -NoNewline
-    if (Test-Path proc:) {
-        Write-Host " PASS" -ForegroundColor Green
-        $testsPassed++
-    } else {
-        Write-Host " FAIL" -ForegroundColor Red
-        $testsFailed++
-        Write-Host "Run Install-ProcDrive.ps1 -Install first" -ForegroundColor Yellow
-        return
-    }
-    
-    # Test 2: Root directory listing
-    Write-Host "Test 2: Listing root directory..." -NoNewline
-    try {
-        $items = Get-ChildItem proc:\ -ErrorAction Stop
-        if ($items.Count -gt 0) {
-            Write-Host " PASS ($($items.Count) items)" -ForegroundColor Green
-            $testsPassed++
-        } else {
-            Write-Host " FAIL (no items)" -ForegroundColor Red
-            $testsFailed++
-        }
-    } catch {
-        Write-Host " FAIL ($_)" -ForegroundColor Red
-        $testsFailed++
-    }
-    
-    # Test 3: Reading cpuinfo
-    Write-Host "Test 3: Reading cpuinfo..." -NoNewline
-    try {
-        $cpuinfo = Get-Content proc:\cpuinfo -Raw -ErrorAction Stop
-        if ($cpuinfo -match 'processor') {
-            Write-Host " PASS" -ForegroundColor Green
-            $testsPassed++
-        } else {
-            Write-Host " FAIL (invalid content)" -ForegroundColor Red
-            $testsFailed++
-        }
-    } catch {
-        Write-Host " FAIL ($_)" -ForegroundColor Red
-        $testsFailed++
-    }
-    
-    # Test 4: Reading meminfo
-    Write-Host "Test 4: Reading meminfo..." -NoNewline
-    try {
-        $meminfo = Get-Content proc:\meminfo -Raw -ErrorAction Stop
-        if ($meminfo -match 'MemTotal') {
-            Write-Host " PASS" -ForegroundColor Green
-            $testsPassed++
-        } else {
-            Write-Host " FAIL (invalid content)" -ForegroundColor Red
-            $testsFailed++
-        }
-    } catch {
-        Write-Host " FAIL ($_)" -ForegroundColor Red
-        $testsFailed++
-    }
-    
-    # Test 5: Network directory
-    Write-Host "Test 5: Accessing net directory..." -NoNewline
-    try {
-        $netItems = Get-ChildItem proc:\net -ErrorAction Stop
-        if ($netItems.Count -gt 0) {
-            Write-Host " PASS ($($netItems.Count) items)" -ForegroundColor Green
-            $testsPassed++
-        } else {
-            Write-Host " FAIL (no items)" -ForegroundColor Red
-            $testsFailed++
-        }
-    } catch {
-        Write-Host " FAIL ($_)" -ForegroundColor Red
-        $testsFailed++
-    }
-    
-    # Test 6: Process directories
-    Write-Host "Test 6: Checking process directories..." -NoNewline
-    try {
-        $procs = Get-ChildItem proc:\ | Where-Object Name -match '^\d+$'
-        if ($procs.Count -gt 0) {
-            Write-Host " PASS ($($procs.Count) processes)" -ForegroundColor Green
-            $testsPassed++
-        } else {
-            Write-Host " FAIL (no process directories)" -ForegroundColor Red
-            $testsFailed++
-        }
-    } catch {
-        Write-Host " FAIL ($_)" -ForegroundColor Red
-        $testsFailed++
-    }
-    
-    # Test 7: Self directory
-    Write-Host "Test 7: Reading self/status..." -NoNewline
-    try {
-        $status = Get-Content proc:\self\status -Raw -ErrorAction Stop
-        if ($status -match 'Name:') {
-            Write-Host " PASS" -ForegroundColor Green
-            $testsPassed++
-        } else {
-            Write-Host " FAIL (invalid content)" -ForegroundColor Red
-            $testsFailed++
-        }
-    } catch {
-        Write-Host " FAIL ($_)" -ForegroundColor Red
-        $testsFailed++
-    }
-    
-    # Test 8: Sys/kernel directory
-    Write-Host "Test 8: Reading sys/kernel/hostname..." -NoNewline
-    try {
-        $hostname = Get-Content proc:\sys\kernel\hostname -Raw -ErrorAction Stop
-        if ($hostname.Trim().Length -gt 0) {
-            Write-Host " PASS ($($hostname.Trim()))" -ForegroundColor Green
-            $testsPassed++
-        } else {
-            Write-Host " FAIL (empty)" -ForegroundColor Red
-            $testsFailed++
-        }
-    } catch {
-        Write-Host " FAIL ($_)" -ForegroundColor Red
-        $testsFailed++
-    }
-    
-    # Test 9: Network stats
-    Write-Host "Test 9: Reading net/dev..." -NoNewline
-    try {
-        $netdev = Get-Content proc:\net\dev -Raw -ErrorAction Stop
-        if ($netdev -match 'Receive') {
-            Write-Host " PASS" -ForegroundColor Green
-            $testsPassed++
-        } else {
-            Write-Host " FAIL (invalid content)" -ForegroundColor Red
-            $testsFailed++
-        }
-    } catch {
-        Write-Host " FAIL ($_)" -ForegroundColor Red
-        $testsFailed++
-    }
-    
-    # Test 10: Version info
-    Write-Host "Test 10: Reading version..." -NoNewline
-    try {
-        $version = Get-Content proc:\version -Raw -ErrorAction Stop
-        if ($version.Length -gt 0) {
-            Write-Host " PASS" -ForegroundColor Green
-            $testsPassed++
-        } else {
-            Write-Host " FAIL (empty)" -ForegroundColor Red
-            $testsFailed++
-        }
-    } catch {
-        Write-Host " FAIL ($_)" -ForegroundColor Red
-        $testsFailed++
-    }
-    
-    # Summary
-    Write-Host "`n=== Test Summary ===" -ForegroundColor Cyan
-    Write-Host "Passed: $testsPassed" -ForegroundColor Green
-    Write-Host "Failed: $testsFailed" -ForegroundColor $(if ($testsFailed -eq 0) { 'Green' } else { 'Red' })
-    Write-Host "Total:  $($testsPassed + $testsFailed)"
+function Get-ProcLines([string]$Path) {
+    # SHiPS returns each file as one string, and -Raw is not supported; split it here.
+    (Get-Content $Path) -split "`r?`n" | Where-Object { $_ -ne '' }
+}
+
+function Initialize-ProcDrive {
+    if (Get-PSDrive proc -ErrorAction SilentlyContinue) { return }
+    Import-Module (Join-Path $PSScriptRoot 'ProcFileSystem.psd1') -Force -WarningAction SilentlyContinue
+    Mount-ProcDrive
+}
+
+function Invoke-ProcTests {
+    $pester = Get-Module -ListAvailable Pester | Where-Object Version -ge '5.0' | Sort-Object Version -Descending | Select-Object -First 1
+    if (-not $pester) { throw 'Pester 5 or later is required: Install-Module Pester -MinimumVersion 5.0 -Scope CurrentUser' }
+    Import-Module $pester -Force
+    $config = New-PesterConfiguration
+    $config.Run.Path = Join-Path $PSScriptRoot 'Tests'
+    $config.Run.PassThru = $true
+    $config.Output.Verbosity = 'Detailed'
+    if (-not $IncludeInstaller) { $config.Filter.ExcludeTag = 'Installer' }
+    $result = Invoke-Pester -Configuration $config
+    exit $result.FailedCount
 }
 
 function Show-Demo {
-    Write-Host "`n=== proc: Drive Interactive Demo ===" -ForegroundColor Cyan
-    
-    if (-not (Test-Path proc:)) {
-        Write-Host "proc: drive not found. Run Install-ProcDrive.ps1 -Install first" -ForegroundColor Red
-        return
-    }
-    
-    Write-Host "`n1. System Information" -ForegroundColor Yellow
-    Write-Host "   Hostname: " -NoNewline
-    Write-Host (Get-Content proc:\sys\kernel\hostname -Raw).Trim() -ForegroundColor White
-    
-    Write-Host "   OS Version: " -NoNewline
-    Write-Host (Get-Content proc:\version -Raw).Trim() -ForegroundColor White
-    
-    $uptime = (Get-Content proc:\uptime -Raw).Split()[0]
-    $uptimeHours = [math]::Round([double]$uptime / 3600, 2)
-    Write-Host "   Uptime: " -NoNewline
-    Write-Host "$uptimeHours hours" -ForegroundColor White
-    
-    Write-Host "`n2. CPU Information" -ForegroundColor Yellow
-    $cpuinfo = Get-Content proc:\cpuinfo -Raw
-    $cpuSections = ($cpuinfo -split "`n`n").Count - 1
-    Write-Host "   Logical Processors: " -NoNewline
-    Write-Host $cpuSections -ForegroundColor White
-    
-    $cpuName = ($cpuinfo -split "`n" | Select-String 'model name' | Select-Object -First 1).ToString().Split(':')[1].Trim()
-    Write-Host "   CPU Model: " -NoNewline
-    Write-Host $cpuName -ForegroundColor White
-    
-    Write-Host "`n3. Memory Information" -ForegroundColor Yellow
-    $meminfo = Get-Content proc:\meminfo -Raw
-    $memTotal = ($meminfo -split "`n" | Select-String 'MemTotal').ToString().Split()[1]
-    $memFree = ($meminfo -split "`n" | Select-String 'MemFree').ToString().Split()[1]
-    $memTotalGB = [math]::Round([int]$memTotal / 1MB, 2)
-    $memFreeGB = [math]::Round([int]$memFree / 1MB, 2)
-    $memUsedGB = $memTotalGB - $memFreeGB
-    
-    Write-Host "   Total Memory: " -NoNewline
-    Write-Host "$memTotalGB GB" -ForegroundColor White
-    Write-Host "   Free Memory: " -NoNewline
-    Write-Host "$memFreeGB GB" -ForegroundColor White
-    Write-Host "   Used Memory: " -NoNewline
-    Write-Host "$memUsedGB GB" -ForegroundColor White
-    
-    Write-Host "`n4. Network Interfaces" -ForegroundColor Yellow
-    $netdev = Get-Content proc:\net\dev -Raw
-    $interfaces = ($netdev -split "`n" | Select-Object -Skip 2 | Where-Object { $_.Trim() }).Count
-    Write-Host "   Active Interfaces: " -NoNewline
-    Write-Host $interfaces -ForegroundColor White
-    
-    Write-Host "`n5. Network Connections" -ForegroundColor Yellow
-    $tcpConns = ((Get-Content proc:\net\tcp -Raw) -split "`n" | Select-Object -Skip 1 | Where-Object { $_.Trim() }).Count
-    $udpConns = ((Get-Content proc:\net\udp -Raw) -split "`n" | Select-Object -Skip 1 | Where-Object { $_.Trim() }).Count
-    Write-Host "   TCP Connections: " -NoNewline
-    Write-Host $tcpConns -ForegroundColor White
-    Write-Host "   UDP Endpoints: " -NoNewline
-    Write-Host $udpConns -ForegroundColor White
-    
-    Write-Host "`n6. Process Information" -ForegroundColor Yellow
-    $processes = (Get-ChildItem proc:\ | Where-Object Name -match '^\d+$').Count
-    Write-Host "   Running Processes: " -NoNewline
-    Write-Host $processes -ForegroundColor White
-    
-    Write-Host "`n7. Current Process (self)" -ForegroundColor Yellow
-    Write-Host "   PID: " -NoNewline
-    Write-Host $PID -ForegroundColor White
-    
-    $selfStatus = Get-Content proc:\self\status -Raw
-    $selfName = ($selfStatus -split "`n" | Select-String 'Name:').ToString().Split("`t")[1].Trim()
-    Write-Host "   Name: " -NoNewline
-    Write-Host $selfName -ForegroundColor White
-    
-    Write-Host "`n8. Storage Information" -ForegroundColor Yellow
-    $mounts = (Get-Content proc:\mounts -Raw) -split "`n" | Where-Object { $_.Trim() }
-    Write-Host "   Mounted Drives: " -NoNewline
-    Write-Host $mounts.Count -ForegroundColor White
-    
-    Write-Host "`n9. Directory Structure" -ForegroundColor Yellow
-    Write-Host "   Root Entries: " -NoNewline
-    $rootItems = Get-ChildItem proc:\
-    Write-Host $rootItems.Count -ForegroundColor White
-    
-    Write-Host "`n   Key Directories:" -ForegroundColor Gray
-    $rootItems | Where-Object PSIsContainer | Select-Object -First 5 | ForEach-Object {
-        Write-Host "     - $($_.Name)" -ForegroundColor DarkGray
-    }
-    
-    Write-Host "`n   Key Files:" -ForegroundColor Gray
-    $rootItems | Where-Object { -not $_.PSIsContainer } | Select-Object -First 5 | ForEach-Object {
-        Write-Host "     - $($_.Name)" -ForegroundColor DarkGray
-    }
+    Initialize-ProcDrive
+    $kv = { param($path) $h = @{}; foreach ($l in Get-ProcLines $path) { $k, $v = $l -split ':\s*', 2; $h[$k.Trim()] = "$v".Trim() }; $h }
+
+    Write-Host "`n=== proc: Drive Demo ===" -ForegroundColor Cyan
+    $uptime = [double]((Get-Content proc:\uptime).Split()[0])
+    Write-Host ("Host      {0}" -f (Get-Content proc:\sys\kernel\hostname).Trim())
+    Write-Host ("OS        {0}" -f (Get-Content proc:\version).Trim())
+    Write-Host ("Uptime    {0:N1} hours" -f ($uptime / 3600))
+    Write-Host ("Load      {0}" -f (Get-Content proc:\loadavg).Trim())
+
+    $cpu = & $kv proc:\cpuinfo
+    $logical = @(Get-ProcLines proc:\cpuinfo | Where-Object { $_ -match '^processor' }).Count
+    Write-Host ("CPU       {0} ({1} logical)" -f $cpu['model name'], $logical)
+
+    $mem = & $kv proc:\meminfo
+    $gb = { param($v) [math]::Round([long]($v -replace ' kB') / 1MB, 1) }
+    Write-Host ("Memory    {0} GB total, {1} GB available, {2} GB page cache" -f (& $gb $mem.MemTotal), (& $gb $mem.MemAvailable), (& $gb $mem.Cached))
+
+    $tcp = @(Get-ProcLines proc:\net\tcp | Select-Object -Skip 1)
+    $listen = @($tcp | Where-Object { ($_.Trim() -split '\s+')[3] -eq '0A' }).Count
+    Write-Host ("Network   {0} IPv4 TCP sockets ({1} listening), {2} interfaces" -f $tcp.Count, $listen, @(Get-ProcLines proc:\net\dev | Select-Object -Skip 2).Count)
+    Write-Host ("Processes {0}" -f @(Get-ChildItem proc:\ | Where-Object Name -match '^\d+$').Count)
+
+    $self = & $kv proc:\self\status
+    Write-Host ("Self      {0} pid {1}, {2} threads, RSS {3}" -f $self.Name, $self.Pid, $self.Threads, $self.VmRSS)
 }
 
 function Invoke-Benchmark {
-    Write-Host "`n=== proc: Drive Performance Benchmark ===" -ForegroundColor Cyan
-    
-    if (-not (Test-Path proc:)) {
-        Write-Host "proc: drive not found. Run Install-ProcDrive.ps1 -Install first" -ForegroundColor Red
-        return
+    Initialize-ProcDrive
+    Write-Host "`n=== proc: Drive Benchmark (ms, median of 5) ===" -ForegroundColor Cyan
+    $cases = [ordered]@{
+        'ls proc:\ (incl. PIDs)' = { Get-ChildItem proc:\ }
+        'cpuinfo'                = { Get-Content proc:\cpuinfo }
+        'meminfo'                = { Get-Content proc:\meminfo }
+        'stat'                   = { Get-Content proc:\stat }
+        'loadavg'                = { Get-Content proc:\loadavg }
+        'net\dev'                = { Get-Content proc:\net\dev }
+        'net\tcp'                = { Get-Content proc:\net\tcp }
+        'net\route'              = { Get-Content proc:\net\route }
+        'self\stat'              = { Get-Content proc:\self\stat }
+        'self\status'            = { Get-Content proc:\self\status }
+        'self\cmdline'           = { Get-Content proc:\self\cmdline }
     }
-    
-    # Benchmark 1: Root directory listing
-    Write-Host "`nBenchmark 1: Root directory listing..." -NoNewline
-    $time = Measure-Command { Get-ChildItem proc:\ | Out-Null }
-    Write-Host " $($time.TotalMilliseconds.ToString('F2')) ms" -ForegroundColor Cyan
-    
-    # Benchmark 2: Reading cpuinfo
-    Write-Host "Benchmark 2: Reading cpuinfo..." -NoNewline
-    $time = Measure-Command { Get-Content proc:\cpuinfo -Raw | Out-Null }
-    Write-Host " $($time.TotalMilliseconds.ToString('F2')) ms" -ForegroundColor Cyan
-    
-    # Benchmark 3: Reading meminfo
-    Write-Host "Benchmark 3: Reading meminfo..." -NoNewline
-    $time = Measure-Command { Get-Content proc:\meminfo -Raw | Out-Null }
-    Write-Host " $($time.TotalMilliseconds.ToString('F2')) ms" -ForegroundColor Cyan
-    
-    # Benchmark 4: Network directory
-    Write-Host "Benchmark 4: Listing net directory..." -NoNewline
-    $time = Measure-Command { Get-ChildItem proc:\net | Out-Null }
-    Write-Host " $($time.TotalMilliseconds.ToString('F2')) ms" -ForegroundColor Cyan
-    
-    # Benchmark 5: Reading network stats
-    Write-Host "Benchmark 5: Reading net/dev..." -NoNewline
-    $time = Measure-Command { Get-Content proc:\net\dev -Raw | Out-Null }
-    Write-Host " $($time.TotalMilliseconds.ToString('F2')) ms" -ForegroundColor Cyan
-    
-    # Benchmark 6: Process enumeration
-    Write-Host "Benchmark 6: Enumerating processes..." -NoNewline
-    $time = Measure-Command { 
-        Get-ChildItem proc:\ | Where-Object Name -match '^\d+$' | Out-Null
+    foreach ($name in $cases.Keys) {
+        $times = 1..5 | ForEach-Object { (Measure-Command { $null = & $cases[$name] }).TotalMilliseconds } | Sort-Object
+        Write-Host ("  {0,-26} {1,8:N1}" -f $name, $times[2])
     }
-    Write-Host " $($time.TotalMilliseconds.ToString('F2')) ms" -ForegroundColor Cyan
-    
-    # Benchmark 7: Reading process info
-    Write-Host "Benchmark 7: Reading self/status..." -NoNewline
-    $time = Measure-Command { Get-Content proc:\self\status -Raw | Out-Null }
-    Write-Host " $($time.TotalMilliseconds.ToString('F2')) ms" -ForegroundColor Cyan
-    
-    # Benchmark 8: Multiple file reads
-    Write-Host "Benchmark 8: Reading 10 different files..." -NoNewline
-    $time = Measure-Command {
-        Get-Content proc:\cpuinfo -Raw | Out-Null
-        Get-Content proc:\meminfo -Raw | Out-Null
-        Get-Content proc:\version -Raw | Out-Null
-        Get-Content proc:\uptime -Raw | Out-Null
-        Get-Content proc:\loadavg -Raw | Out-Null
-        Get-Content proc:\stat -Raw | Out-Null
-        Get-Content proc:\mounts -Raw | Out-Null
-        Get-Content proc:\filesystems -Raw | Out-Null
-        Get-Content proc:\net\dev -Raw | Out-Null
-        Get-Content proc:\net\tcp -Raw | Out-Null
-    }
-    Write-Host " $($time.TotalMilliseconds.ToString('F2')) ms" -ForegroundColor Cyan
 }
 
-# Main execution
-if ($RunTests) {
-    Test-ProcDrive
-} elseif ($Demo) {
-    Show-Demo
-} elseif ($Benchmark) {
-    Invoke-Benchmark
-} else {
-    Write-Host "proc: Drive Test Suite" -ForegroundColor Cyan
-    Write-Host "`nUsage:" -ForegroundColor Yellow
-    Write-Host "  .\Test-ProcDrive.ps1 -RunTests     # Run validation tests"
-    Write-Host "  .\Test-ProcDrive.ps1 -Demo         # Show interactive demo"
-    Write-Host "  .\Test-ProcDrive.ps1 -Benchmark    # Run performance benchmarks"
-    Write-Host "`nMake sure to install the proc: drive first using Install-ProcDrive.ps1 -Install"
+switch ($PSCmdlet.ParameterSetName) {
+    'Tests'     { Invoke-ProcTests }
+    'Demo'      { Show-Demo }
+    'Benchmark' { Invoke-Benchmark }
+    default {
+        Write-Host 'proc: Drive Test Suite' -ForegroundColor Cyan
+        Write-Host '  .\Test-ProcDrive.ps1 -RunTests [-IncludeInstaller]  # Pester suite; exit code = failures'
+        Write-Host '  .\Test-ProcDrive.ps1 -Demo                          # summary of the system via proc:'
+        Write-Host '  .\Test-ProcDrive.ps1 -Benchmark                     # read timings'
+    }
 }
